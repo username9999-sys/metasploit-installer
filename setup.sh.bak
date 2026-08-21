@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# METASPLOIT-INSTALLER MASTER ORCHESTRATOR — setup.sh v3.1 (TERMUX/NON-ROOT FIXED)
+# Single-script full-stack deployment: works on Ubuntu/Debian/Kali, Fedora, Arch, Termux
+# ==============================================================================
+set -euo pipefail; IFS=$'\n\t'
+
+# ── Colors ──────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+# ── Global State ────────────────────────────────────────────────────────────────
+SCRIPT_START_TIME=$(date +%s)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+_BG_PIDS=(); _SPINNER_PID=""; DRY_RUN=false; FORCE_MODE=false
+SELF_UPDATED=false; _INSTALL_PHASE="init"
+DO_RESUME=false
+
+# ── Logging ─────────────────────────────────────────────────────────────────────
+log()   { echo -e "  ${GREEN}[✓]${NC} $(date +%H:%M:%S) $*"; }
+info()  { echo -e "  ${BLUE}[*]${NC} $*"; }
+warn()  { echo -e "  ${YELLOW}[!]${NC} $*" >&2; }
+err()   { echo -e "  ${RED}[✗]${NC} $*" >&2; }
+step()  { echo -e "\n${CYAN}${BOLD}═══ $* ═══${NC}\n"; }
+title() { echo -e "${MAGENTA}${BOLD}$*${NC}"; }
+banner_box() {
+    echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}║  METASPLOIT INSTALLER — Master Orchestrator v3.1           ║${NC}"
+    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+}
+
+# ── Trap ────────────────────────────────────────────────────────────────────────
+on_exit() {
+    local ec=$?
+    for p in "${_BG_PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+    [[ -n "${_SPINNER_PID:-}" ]] && kill "$_SPINNER_PID" 2>/dev/null || true
+    if [[ $ec -ne 0 && $ec -ne 130 ]]; then
+        err "Exit code $ec at line ${BASH_LINENO[0]:-?}: ${BASH_COMMAND:-unknown}"
+    fi
+}
+trap on_exit EXIT; trap 'echo -e "\n${YELLOW}[!] SIGINT${NC}"; exit 130' INT
+trap 'echo -e "\n${YELLOW}[!] SIGTERM${NC}"; exit 143' TERM
+
+# ── Core Helpers ────────────────────────────────────────────────────────────────
+cmd_exists() { command -v "$1" &>/dev/null; }
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+has_sudo() { cmd_exists sudo && sudo -n true 2>/dev/null; }
+user_mode() { is_root && echo "root" || { has_sudo && echo "sudo" || echo "normal"; }; }
+is_termux() { [[ -d "/data/data/com.termux" ]] || cmd_exists termux-info 2>/dev/null; }
+
+# SAFE: Run with appropriate privileges - NO EVAL
+priv_run() {
+    case "$(user_mode)" in
+        root)   "$@" ;;
+        sudo)   sudo "$@" ;;
+        normal) "$@" 2>/dev/null || { warn "Need sudo for: $*"; return 1; } ;;
+    esac
+}
+
+ask_yesno() {
+    local prompt="${1:-Continue?}" d="${2:-y}"; $FORCE_MODE && return 0
+    local h; [[ "$d" == "y" ]] && h="[Y/n]" || h="[y/N]"
+    local a; read -r -p "  [?] $prompt $h: " a; a="${a:-$d}"
+    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]]
+}
+
+# ── Spinner ─────────────────────────────────────────────────────────────────────
+spinner() { local pid=$1 m="${2:-Working}"; local s="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    while kill -0 "$pid" 2>/dev/null; do for ((i=0;i<${#s};i++)); do
+        printf "\r  ${BLUE}%s${NC} %s" "${s:$i:1}" "$m"; sleep 0.1; done; done
+    printf "\r  ${GREEN}✓${NC} %s Done\n" "$m"; }
+
+# ── Progress file helpers ───────────────────────────────────────────────────────
+PROGRESS_FILE=""
+mark_done() { echo "[DONE] $(date +%H:%M:%S) $1" >> "${PROGRESS_FILE:-/dev/null}" 2>/dev/null || true; }
+is_done() { [[ -f "${PROGRESS_FILE:-}" ]] && grep -qF "[DONE] $1" "$PROGRESS_FILE" 2>/dev/null; }
+resume_skip() { local p="$1"; [[ -f "${PROGRESS_FILE:-}" ]] && grep -qF "[DONE] $p" "$PROGRESS_FILE" 2>/dev/null && { log "Skipping: $p"; return 0; } || return 1; }
+
+# ── Timer ───────────────────────────────────────────────────────────────────────
+elapsed() { echo "$(($(date +%s) - SCRIPT_START_TIME))s"; }
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  ENVIRONMENT DETECTION                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+detect_environment() {
+    export ARCH="$(uname -m)"
+    export OS_TYPE; case "$(uname -s)" in Linux) OS_TYPE="linux" ;; Darwin) OS_TYPE="macos" ;; *) OS_TYPE="other" ;; esac
+
+    if [[ -f /etc/os-release ]]; then source /etc/os-release 2>/dev/null || true; export DISTRO_ID="${ID,,}"; export DISTRO_VERSION="${VERSION_ID:-}"
+    elif [[ -f /etc/arch-release ]]; then export DISTRO_ID="arch"
+    elif is_termux; then export DISTRO_ID="termux"
+    else export DISTRO_ID="unknown"; fi
+
+    case "$DISTRO_ID" in
+        ubuntu|debian|kali|parrot|linuxmint|pop|raspbian|zorin) export DISTRO_FAMILY="debian"; export PACKAGE_MANAGER="apt"; export PKG_INSTALL="sudo apt-get install -y --no-install-recommends"; export PKG_UPDATE="sudo apt-get update -qq" ;;
+        fedora|rhel|centos|rocky|alma|oracle) export DISTRO_FAMILY="redhat"; export PACKAGE_MANAGER="dnf"; export PKG_INSTALL="sudo dnf install -y"; export PKG_UPDATE="sudo dnf check-update -qq" ;;
+        arch|manjaro|endeavouros|garuda) export DISTRO_FAMILY="arch"; export PACKAGE_MANAGER="pacman"; export PKG_INSTALL="sudo pacman -Sy --noconfirm --needed"; export PKG_UPDATE="sudo pacman -Sy --noconfirm" ;;
+        opensuse*|sles) export DISTRO_FAMILY="suse"; export PACKAGE_MANAGER="zypper"; export PKG_INSTALL="sudo zypper install -y"; export PKG_UPDATE="" ;;
+        termux) export DISTRO_FAMILY="termux"; export PACKAGE_MANAGER="pkg"; export PKG_INSTALL="pkg install -y"; export PKG_UPDATE="pkg update -qq" ;;
+        *) export DISTRO_FAMILY="unknown"; export PACKAGE_MANAGER=""; export PKG_INSTALL=""; export PKG_UPDATE="" ;;
+    esac
+
+    case "$ARCH" in
+        x86_64|amd64) export BIN_ARCH="amd64"; export GO_ARCH="amd64" ;;
+        aarch64|arm64) export BIN_ARCH="arm64"; export GO_ARCH="arm64" ;;
+        armv7l|arm) export BIN_ARCH="arm"; export GO_ARCH="armv6l" ;;
+        *) export BIN_ARCH="$ARCH"; export GO_ARCH="$ARCH"; warn "Unknown arch: $ARCH" ;;
+    esac
+
+    export CURRENT_USER="$(whoami)"; export HOME_DIR="$HOME"; export USER_MODE="$(user_mode)"
+    export HTTP_PROXY="${http_proxy:-${HTTP_PROXY:-}}"; export HTTPS_PROXY="${https_proxy:-${HTTPS_PROXY:-}}"
+    [[ -n "$HTTP_PROXY" ]] && git config --global http.proxy "$HTTP_PROXY" 2>/dev/null || true
+    [[ -n "$HTTPS_PROXY" ]] && git config --global https.proxy "$HTTPS_PROXY" 2>/dev/null || true
+
+    info "Env: $OS_TYPE/$DISTRO_ID/$DISTRO_FAMILY arch=$ARCH user=$CURRENT_USER mode=$USER_MODE"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CACHE SYSTEM                                                               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+CACHE_DIR="${HOME}/.cache/metasploit-installer"
+init_cache() { mkdir -p "$CACHE_DIR" 2>/dev/null || true; }
+cache_get() { local f="$1" h="${2:-}"; local c="$CACHE_DIR/$f"; [[ -f "$c" ]] || return 1; [[ -n "$h" ]] && { local a; a=$(sha256sum "$c" 2>/dev/null | awk '{print $1}'); [[ "$a" == "$h" ]] || return 1; }; cp "$c" . 2>/dev/null || ln "$c" . 2>/dev/null || return 1; log "Cached: $f"; return 0; }
+cache_store() { local f="$1"; cp "$f" "$CACHE_DIR/" 2>/dev/null || true; info "Cached: $f"; }
+clear_cache() { step "Clear Cache"; [[ -d "$CACHE_DIR" ]] && rm -rf "$CACHE_DIR" && log "Cleared" || info "No cache"; }
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SELF-UPDATE                                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+self_update() {
+    [[ "$SELF_UPDATED" == "true" ]] && return 0
+    [[ -d "$SCRIPT_DIR/.git" ]] || return 0
+    info "Checking updates..."; cd "$SCRIPT_DIR"
+    git fetch origin main 2>/dev/null || { warn "No network/remote"; return 0; }
+    local lh; lh=$(git rev-parse HEAD 2>/dev/null || echo "")
+    local rh; rh=$(git rev-parse origin/main 2>/dev/null || echo "")
+    [[ "$lh" != "$rh" && -n "$rh" ]] && { info "Update found"; git pull origin main 2>/dev/null || warn "Pull failed"; log "Updated to $rh"; exec bash "$0" --updated "$@"; exit 0; }
+    log "Up to date"; cd - >/dev/null
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CHECKPOINT & RESUME                                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+init_checkpoint() {
+    PROGRESS_FILE="$INSTALL_DIR/.progress"
+    $DRY_RUN && { info "DRY-RUN: virtual progress"; return 0; }
+    if [[ -f "$PROGRESS_FILE" ]]; then
+        if is_done "full_install"; then
+            warn "Already completed per progress file"
+            ask_yesno "Re-run anyway?" "n" || { info "Use --force"; exit 0; }
+            rm -f "$PROGRESS_FILE"
+        elif $DO_RESUME; then
+            log "Resume mode: skipping completed phases"
+        else
+            warn "Partial progress found — use --resume to continue"
+            grep '^\[DONE\]' "$PROGRESS_FILE" 2>/dev/null | while read -r line; do echo "    $line"; done
+            ask_yesno "Start fresh?" "y" || { info "Re-run with --resume"; exit 0; }
+            rm -f "$PROGRESS_FILE"
+        fi
+    fi
+    echo "# metasploit-installer progress — $(date -Iseconds)" > "$PROGRESS_FILE"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CONFIG SYSTEM (.env)                                                       ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+DEFAULT_INSTALL_DIR="$HOME/metasploit-installer"
+CONFIG_FILE=""
+GITHUB_REPO_URL=""
+SKIP_TOOLS=""
+APT_MIRROR=""
+AUTO_PUSH=false
+DEBUG_MODE=false
+
+load_config() {
+    CONFIG_FILE="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}/config.env"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # SAFE: only KEY=VALUE
+        while IFS='=' read -r key val; do
+            [[ -z "$key" ]] && continue
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            if [[ "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+                val="${val%%#*}"; val="${val%%*( )}"
+                export "$key=$val"
+            fi
+        done < <(grep -E '^[A-Z_][A-Z0-9_]*=' "$CONFIG_FILE" 2>/dev/null || true)
+        INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+        GITHUB_REPO_URL="${GITHUB_REPO_URL:-}"
+        SKIP_TOOLS="${SKIP_TOOLS:-}"
+        APT_MIRROR="${APT_MIRROR:-}"
+        AUTO_PUSH="${AUTO_PUSH:-false}"
+        DEBUG_MODE="${DEBUG_MODE:-false}"
+        info "Config loaded: $CONFIG_FILE"
+    else
+        info "No config.env — using defaults"
+    fi
+    export INSTALL_DIR GITHUB_REPO_URL SKIP_TOOLS APT_MIRROR AUTO_PUSH DEBUG_MODE
+}
+
+create_default_config() {
+    local cfg="$INSTALL_DIR/config.env"
+    $DRY_RUN && { info "DRY-RUN: would write $cfg"; return 0; }
+    mkdir -p "$INSTALL_DIR"
+    cat > "$cfg" << CFGEOF
+# metasploit-installer CONFIGURATION
+INSTALL_DIR="${INSTALL_DIR:-$HOME/metasploit-installer}"
+GITHUB_REPO_URL=""
+SKIP_TOOLS=""
+APT_MIRROR=""
+AUTO_PUSH=false
+DEBUG_MODE=false
+CFGEOF
+    chmod 600 "$cfg"; log "Created: $cfg (600)"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  MAIN INSTALLER — DELEGATES TO setup-metasploit.sh                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_install_metasploit() {
+    step "Metasploit Framework Installation"
+    bridge_all
+    if [[ -f "$SCRIPT_DIR/setup-metasploit.sh" ]]; then
+        if [[ "${1:-}" == "--auto" || "$FORCE_MODE" == "true" ]]; then
+            bash "$SCRIPT_DIR/setup-metasploit.sh" --auto
+        else
+            bash "$SCRIPT_DIR/setup-metasploit.sh"
+        fi
+    else
+        err "setup-metasploit.sh not found!"
+        exit 1
+    fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  DEPENDENCIES (minimal wrapper)                                             ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_install_deps() {
+    step "System Dependencies"
+    bridge_all
+    if [[ -f "$SCRIPT_DIR/lib/deps.sh" ]]; then
+        bash "$SCRIPT_DIR/lib/deps.sh" "${1:-}"
+    else
+        warn "Using setup-metasploit.sh for deps"
+        bash "$SCRIPT_DIR/setup-metasploit.sh" --auto 2>/dev/null || true
+    fi
+}
+
+install_go_tools() {
+    resume_skip "go_tools" && return 0
+    step "Go Security Tools"
+    [[ -n "${SKIP_TOOLS:-}" ]] && echo "$SKIP_TOOLS" | grep -q "go" && { warn "Skipping go tools"; return 0; }
+    $DRY_RUN && { info "DRY-RUN"; return 0; }
+    cmd_exists go || {
+        info "Installing Go..."; case "$DISTRO_FAMILY" in
+            debian) priv_run apt-get install -y golang-go ;;
+            redhat) priv_run dnf install -y golang ;;
+            arch) priv_run pacman -Sy --noconfirm go ;;
+            termux) pkg install -y golang ;;
+            *) curl -fsSL "https://go.dev/dl/go1.22.0.linux-${GO_ARCH}.tar.gz" -o /tmp/go.tar.gz && priv_run rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz && export PATH="$PATH:/usr/local/go/bin" ;;
+        esac
+    }
+    export PATH="$HOME/go/bin:$PATH"; mkdir -p "$HOME/go/bin"
+    local tools=(
+        "subfinder|go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+        "httpx|go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
+        "nuclei|go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+        "assetfinder|go install -v github.com/tomnomnom/assetfinder@latest"
+        "gau|go install -v github.com/lc/gau/v2/cmd/gau@latest"
+    )
+    for t in "${tools[@]}"; do
+        IFS='|' read -r name cmd <<< "$t"
+        info "Installing $name..."; eval "$cmd" 2>&1 | tail -3 || warn "$name failed"
+    done
+    mark_done "go_tools"
+}
+
+install_python_tools() {
+    resume_skip "python_tools" && return 0
+    step "Python Security Tools"
+    [[ -n "${SKIP_TOOLS:-}" ]] && echo "$SKIP_TOOLS" | grep -q "python" && { warn "Skipping python tools"; return 0; }
+    $DRY_RUN && { info "DRY-RUN"; return 0; }
+    cmd_exists pipx || { priv_run apt-get install -y pipx 2>/dev/null || python3 -m pip install --user pipx 2>/dev/null || true; }
+    pipx ensurepath 2>/dev/null || true
+    export PATH="$HOME/.local/bin:$PATH"
+    local tools=(
+        "impacket|pipx install impacket 2>/dev/null || python3 -m pip install --user impacket"
+        "mitm6|pipx install mitm6 2>/dev/null || python3 -m pip install --user mitm6"
+        "crackmapexec|pipx install crackmapexec 2>/dev/null || python3 -m pip install --user crackmapexec"
+    )
+    for t in "${tools[@]}"; do
+        IFS='|' read -r name cmd <<< "$t"
+        info "Installing $name..."; eval "$cmd" 2>&1 | tail -3 || warn "$name failed"
+    done
+    mark_done "python_tools"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  HEALTH CHECK & SMOKE TEST                                                  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_health_check() {
+    step "Health Check & Auto-Repair"
+    local issues=0 fixes=0
+    check_fix() {
+        local label="$1" check="$2" fix="${3:-}"
+        if eval "$check" 2>/dev/null; then log "$label ✓"; else
+            warn "$label ✗ — fixing..."; issues=$((issues+1))
+            [[ -n "$fix" ]] && eval "$fix" 2>/dev/null && { log "$label FIXED"; fixes=$((fixes+1)); } || err "$label fix FAILED"; fi
+    }
+    check_fix "msfconsole in PATH" 'command -v msfconsole &>/dev/null' ''
+    check_fix "PostgreSQL running" 'pg_isready -q 2>/dev/null' 'msfdb reinit 2>/dev/null || true'
+    check_fix "msfdb connected" 'msfconsole -q -x "db_status; exit" 2>/dev/null | grep -q connected' 'msfdb reinit 2>/dev/null'
+    check_fix "Go bin in PATH" 'echo "$PATH" | grep -q "$HOME/go/bin"' 'export PATH=$HOME/go/bin:$PATH'
+    check_fix "pipx bin in PATH" 'echo "$PATH" | grep -q "$HOME/.local/bin"' 'export PATH=$HOME/.local/bin:$PATH'
+    check_fix "nmap available" 'command -v nmap &>/dev/null' ''
+    check_fix "git config ok" 'git config --global user.name &>/dev/null' 'git config --global user.name "Pentester" && git config --global user.email "pentester@localhost"'
+    echo ""; echo -e "  ${BOLD}Health: ${GREEN}$fixes${NC} fixed, ${YELLOW}$((issues-fixes))${NC} remaining"
+}
+
+run_smoke_test() {
+    resume_skip "smoke_test" && return 0
+    step "Smoke Test"
+    $DRY_RUN && { info "DRY-RUN"; return 0; }
+    local out="$INSTALL_DIR/smoke_test.md" pass=0 fail=0
+    mkdir -p "$(dirname "$out")"
+    { echo "# Smoke Test — $(date)"; echo ""; echo "| Tool | Status | Info |"; echo "|------|--------|------|"; } > "$out.tmp"
+    smoke() { local t="$1" c="$2"; if eval "$c" &>/dev/null; then echo "| $t | ✅ PASS | $(eval "$c" 2>&1 | head -1 | tr -d '\n' | cut -c1-40) |" >> "$out.tmp"; log "$t PASS"; pass=$((pass+1)); else echo "| $t | ❌ FAIL | Not found |" >> "$out.tmp"; warn "$t FAIL"; fail=$((fail+1)); fi; }
+    smoke "nmap" 'nmap --version 2>&1'
+    smoke "msfconsole" 'msfconsole -q -x "version; exit" 2>&1'
+    smoke "python3" 'python3 --version 2>&1'
+    smoke "go" 'go version 2>&1'
+    smoke "subfinder" 'subfinder -version 2>&1'
+    smoke "httpx" 'httpx -version 2>&1'
+    smoke "nuclei" 'nuclei -version 2>&1'
+    smoke "git" 'git --version 2>&1'
+    cp "$out.tmp" "$out"; rm -f "$out.tmp"
+    echo "Summary: $pass PASS, $fail FAIL" >> "$out"
+    echo -e "  ${BOLD}Smoke: ${GREEN}$pass PASS${NC} ${RED}$fail FAIL${NC}"
+    mark_done "smoke_test"
+}
+
+generate_report() {
+    step "Generate Report"
+    local r="$INSTALL_DIR/system_report.md"
+    mkdir -p "$(dirname "$r")"
+    $DRY_RUN && { info "DRY-RUN"; return 0; }
+    cat > "$r" << RPEOF
+# System Report — $(date -Iseconds)
+## Host
+| Item | Value |
+|------|-------|
+| Hostname | $(hostname) | Kernel | $(uname -r) | Arch | $(uname -m) |
+## Tools
+$(for t in nmap msfconsole python3 go subfinder httpx nuclei git; do echo "- **$t**: \$(command -v "$t" && ($t --version 2>/dev/null || echo installed) || echo 'NOT FOUND')"; done)
+## Directories
+\`\`\` $(find "$INSTALL_DIR" -maxdepth 3 -type d 2>/dev/null | sort | head -50) \`\`\`
+RPEOF
+    log "Report: $r"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  MODULE BROWSER                                                             ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+list_available_modules() {
+    echo ""; echo -e "${BOLD}Available Modules:${NC}"; echo ""
+    for cat_dir in "$INSTALL_DIR"/modules/*/; do
+        [[ -d "$cat_dir" ]] || continue
+        local cat_name; cat_name="$(basename "$cat_dir")"
+        local count; count=$(find "$cat_dir" -type f -name '*.sh' 2>/dev/null | wc -l)
+        echo -e "  ${CYAN}$cat_name${NC} — $count modules"
+        for sub_dir in "$cat_dir"*/; do
+            [[ -d "$sub_dir" ]] || continue
+            local sub_name; sub_name="$(basename "$sub_dir")"
+            for f in "$sub_dir"*.sh; do [[ -f "$f" ]] || continue; local fname; fname="$(basename "$f")"; echo -e "    ${DIM}$sub_name${NC}/${GREEN}$fname${NC}"; done
+        done
+    done
+    echo ""
+}
+do_browse_modules() { step "Module Browser"; list_available_modules; info "Run: bash msf-run.sh module <category>/<sub>/<file>"; }
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  FILE POPULATION (creates all module files)                                 ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+populate_all_files() {
+    step "Populating All Files"
+    $DRY_RUN && { info "DRY-RUN"; return 0; }
+    # This function would create all missing files
+    # For now, we rely on the existing module files
+    mark_done "populate_all_files"
+    log "Using existing module files"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  DASHBOARD INSTALL                                                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+install_dashboard() {
+    resume_skip "dashboard_installed" && return 0
+    step "Web Dashboard"
+    info "Installing Python deps..."
+    pipx install flask flask-socketio eventlet 2>/dev/null || python3 -m pip install --user flask flask-socketio eventlet 2>/dev/null || true
+    mark_done "dashboard_installed"
+    log "Dashboard ready: python3 dashboard/app.py"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  PATH SETUP                                                                 ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+setup_path() {
+    resume_skip "path_setup" && return 0
+    step "PATH Setup"
+    local bashrc="$HOME/.bashrc"
+    local marker="# metasploit-installer PATH"
+    if ! grep -qF "$marker" "$bashrc" 2>/dev/null; then
+        cat >> "$bashrc" << 'PATHEOF'
+
+# metasploit-installer PATH
+export PATH="$HOME/go/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+export GOROOT="${GOROOT:-/usr/local/go}"
+# END metasploit-installer PATH
+PATHEOF
+        log "PATH added to ~/.bashrc"
+    else
+        info "PATH already in ~/.bashrc"
+    fi
+    export PATH="$HOME/go/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+    mark_done "path_setup"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  ROOT BRIDGE INTEGRATION                                                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+bridge_check() {
+    if is_root; then
+        warn "Running as ROOT — PostgreSQL initdb WILL FAIL"
+        warn "initdb refuses to run as root (security restriction)"
+        info "Solutions:"
+        info "  1. Run as normal user (recommended)"
+        info "  2. Create user: useradd -m -s /bin/bash msfuser && su - msfuser"
+        ask_yesno "Continue anyway?" "n" || { info "Exiting. Run as normal user."; exit 0; }
+        return 0
+    fi
+}
+bridge_all() { bridge_check; if is_termux bridge_all() { bridge_check; if is_termux; then info "Termux detected"; export PATH="$PREFIX/bin:$PATH"; export LD_LIBRARY_PATH="$PREFIX/lib"; export PG_CONFIG=$(command -v pg_config 2>/dev/null); fi }bridge_all() { bridge_check; if is_termux; then info "Termux detected"; export PATH="$PREFIX/bin:$PATH"; export LD_LIBRARY_PATH="$PREFIX/lib"; export PG_CONFIG=$(command -v pg_config 2>/dev/null); fi } [[ -n "${PREFIX:-}" ]]; then info "Termux detected"; export PATH="${PREFIX}/bin:$PATH"; export LD_LIBRARY_PATH="${PREFIX}/lib"; export PG_CONFIG=$(command -v pg_config 2>/dev/null); fi }
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  UNINSTALL                                                                  ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_uninstall() {
+    banner_box
+    step "UNINSTALL"
+    warn "Deletes: $INSTALL_DIR and ~/.msf4"
+    ask_yesno "ARE YOU SURE?" "n" || { info "Aborted"; exit 0; }
+    $DRY_RUN && { info "DRY-RUN"; return 0; }
+    rm -rf "$INSTALL_DIR" "$HOME/.msf4" "$HOME/db_data" 2>/dev/null
+    clear_cache
+    sed -i '/# metasploit-installer PATH/,/# END metasploit-installer PATH/d' "$HOME/.bashrc" 2>/dev/null || true
+    log "Uninstall complete"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  MAIN ENTRY POINT                                                           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+main() {
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --full) FORCE_MODE=true; shift ;;
+            --auto) FORCE_MODE=true; DRY_RUN=false; shift ;;
+            --dry-run) DRY_RUN=true; shift ;;
+            --force) FORCE_MODE=true; shift ;;
+            --resume) DO_RESUME=true; shift ;;
+            --uninstall) do_uninstall; exit 0 ;;
+            --health) detect_environment; do_health_check; exit 0 ;;
+            --smoke) detect_environment; run_smoke_test; exit 0 ;;
+            --report) detect_environment; generate_report; exit 0 ;;
+            --modules) do_browse_modules; exit 0 ;;
+            --deps) detect_environment; do_install_deps; exit 0 ;;
+            --config) load_config; create_default_config; exit 0 ;;
+            --path) setup_path; exit 0 ;;
+            --update) self_update "$@"; exit 0 ;;
+            --help|-h) cat << HELP
+metasploit-installer v3.1 — Master Orchestrator
+
+Usage: bash setup.sh [OPTIONS]
+
+Options:
+  --full        Full auto install (force, no prompts)
+  --auto        Auto install with defaults
+  --dry-run     Preview what would be done
+  --force       Force overwrite existing
+  --resume      Resume from last checkpoint
+  --uninstall   Remove all traces
+  --health      Health check & auto-repair
+  --smoke       Run smoke test
+  --report      Generate system report
+  --modules     List available modules
+  --deps        Install system deps only
+  --config      Create default config.env
+  --path        Setup PATH in ~/.bashrc
+  --update      Self-update from Git
+  --help        This help
+
+Environment:
+  INSTALL_DIR     Install directory (default: ~/metasploit-installer)
+  SKIP_TOOLS      Comma-separated: go,python,ruby,nmap
+  MSF_PASS        Pre-set DB password
+  MSF_BRANCH      Git branch (default: main)
+
+Example:
+  bash setup.sh --full
+  MSF_PASS=secret bash setup.sh --auto
+HELP
+            exit 0 ;;
+            *) warn "Unknown: $1"; exit 1 ;;
+        esac
+    done
+
+    # Default: interactive menu
+    export INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+    banner_box
+    load_config
+    detect_environment
+    init_checkpoint
+
+    # Full auto path
+    if [[ "$FORCE_MODE" == "true" ]]; then
+        step "AUTO MODE — Full Installation"
+        create_default_config
+        populate_all_files
+        do_install_deps
+        install_go_tools
+        install_python_tools
+        do_install_metasploit --auto
+        install_dashboard
+        setup_path
+        generate_report
+        run_smoke_test
+        log "AUTO INSTALL COMPLETE"
+        print_summary
+        exit 0
+    fi
+
+    # Interactive menu
+    echo -e "${BOLD}Select action:${NC}"
+    echo -e "  1) ${GREEN}Full Install${NC} (--full equivalent)"
+    echo -e "  2) ${GREEN}Install Metasploit${NC} (deps + msf + db)"
+    echo -e "  3) ${GREEN}Deps Only${NC} (system packages)"
+    echo -e "  4) ${GREEN}Health Check${NC} (--health)"
+    echo -e "  5) ${GREEN}Smoke Test${NC} (--smoke)"
+    echo -e "  6) ${GREEN}Browse Modules${NC} (--modules)"
+    echo -e "  7) ${GREEN}Root Bridge${NC} (fix non-root issues)"
+    echo -e "  8) ${GREEN}Dashboard${NC} (web UI)"
+    echo -e "  9) ${RED}Uninstall${NC} (--uninstall)"
+    echo -e "  0) Exit"
+    echo ""
+    read -r -p "  [?] Choice (0-9): " choice
+    case "$choice" in
+        1) FORCE_MODE=true; main --full ;;
+        2) create_default_config; populate_all_files; do_install_metasploit ;;
+        3) do_install_deps ;;
+        4) do_health_check ;;
+        5) run_smoke_test ;;
+        6) do_browse_modules ;;
+        7) bridge_all ;;
+        8) install_dashboard && python3 "$SCRIPT_DIR/dashboard/app.py" ;;
+        9) do_uninstall ;;
+        0) info "Bye!"; exit 0 ;;
+        *) warn "Invalid" ;;
+    esac
+}
+
+# Print summary
+print_summary() {
+    echo ""
+    echo -e "${RED}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}  ║        INSTALLATION COMPLETE                         ║${NC}"
+    echo -e "${RED}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BOLD}▸ Start Metasploit:${NC}  ${GREEN}source ~/.bashrc && msfconsole${NC}"
+    echo -e "  ${BOLD}▸ Browse Modules:${NC}   ${GREEN}bash msf-run.sh modules${NC}"
+    echo -e "  ${BOLD}▸ Run Module:${NC}       ${GREEN}bash msf-run.sh module scanner/smb/smb_scanner 192.168.1.0/24${NC}"
+    echo -e "  ${BOLD}▸ AI Assistant:${NC}     ${GREEN}bash msf-ai.sh target 192.168.1.50${NC}"
+    echo -e "  ${BOLD}▸ C2 Launcher:${NC}      ${GREEN}bash c2-run.sh menu${NC}"
+    echo -e "  ${BOLD}▸ Dashboard:${NC}        ${GREEN}bash msf-run.sh dashboard${NC}"
+    echo ""
+}
+
+main "$@"

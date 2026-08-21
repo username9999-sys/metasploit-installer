@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# AWS ENUM — AWS cloud enumeration
+# Usage: bash aws_enum.sh [PROFILE]
+# ==============================================================================
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../../../lib/common.sh" 2>/dev/null || true
+source "$SCRIPT_DIR/../../../lib/env.sh" 2>/dev/null || true
+PROFILE="${1:-default}"
+IN_MSF=false; [[ "${MSF_CONSOLE:-}" == "1" ]] || [[ -n "${MSFCONSOLE_BIN:-}" ]] && IN_MSF=true
+run_msf() { local m="$1"; shift; local c="use $m"; for a in "$@"; do c="$c; set $a"; done; c="$c; run"; echo "$c"; }
+echo ""; echo "=== AWS ENUMERATION — Profile: $PROFILE ==="; echo ""
+echo -e "--- ${BLUE}Prerequisites${NC} ---"
+echo "aws configure --profile $PROFILE"
+echo "pip3 install awscli boto3 botocore"
+echo "pip3 install pacu prowler scoutsuite cloudsploit"
+echo ""
+echo -e "--- ${BLUE}Identity & Access${NC} ---"
+echo "aws iam get-user --profile $PROFILE"
+echo "aws iam list-users --profile $PROFILE"
+echo "aws iam list-roles --profile $PROFILE"
+echo "aws iam list-policies --scope Local --profile $PROFILE"
+echo "aws iam get-account-authorization-details --profile $PROFILE"
+echo ""
+echo -e "--- ${BLUE}EC2 & Compute${NC} ---"
+echo "aws ec2 describe-instances --profile $PROFILE"
+echo "aws ec2 describe-security-groups --profile $PROFILE"
+echo "aws ec2 describe-key-pairs --profile $PROFILE"
+echo "aws ec2 describe-images --owners self --profile $PROFILE"
+echo ""
+echo -e "--- ${BLUE}S3 Buckets${NC} ---"
+echo "aws s3 ls --profile $PROFILE"
+echo "aws s3api list-buckets --profile $PROFILE"
+echo "# Check public buckets:"
+echo "aws s3api get-bucket-acl --bucket <name> --profile $PROFILE"
+echo "aws s3api get-bucket-policy --bucket <name> --profile $PROFILE"
+echo ""
+echo -e "--- ${BLUE}Lambda & Secrets${NC} ---"
+echo "aws lambda list-functions --profile $PROFILE"
+echo "aws secretsmanager list-secrets --profile $PROFILE"
+echo "aws ssm get-parameters-by-path --path / --recursive --with-decryption --profile $PROFILE"
+echo ""
+echo -e "--- ${BLUE}CloudTrail & Config${NC} ---"
+echo "aws cloudtrail describe-trails --profile $PROFILE"
+echo "aws configservice describe-configuration-recorders --profile $PROFILE"
+echo ""
+echo -e "--- ${BLUE}Automated Tools${NC} ---"
+echo "pacu --profile $PROFILE          # Exploitation framework"
+echo "prowler aws --profile $PROFILE   # Security audit"
+echo "scout aws --profile $PROFILE     # Security findings"
+echo "cloudsploit scan --profile $PROFILE"
+echo ""
+echo -e "--- ${BLUE}Metasploit${NC} ---"
+$IN_MSF && run_msf "auxiliary/gather/aws_enum" "PROFILE $PROFILE"
+$IN_MSF && run_msf "auxiliary/scanner/http/aws_bucket_enum" "RHOSTS s3.amazonaws.com"
+$IN_MSF && run_msf "auxiliary/scanner/http/aws_ec2_enum" "RHOSTS ec2.amazonaws.com"

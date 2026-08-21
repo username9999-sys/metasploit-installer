@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metasploit Installer Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #1a1a2e; color: #eee; min-height: 100vh; }
+        header { background: #16213e; padding: 1rem 2rem; border-bottom: 2px solid #e94560; display: flex; justify-content: space-between; align-items: center; }
+        header h1 { color: #e94560; font-size: 1.5rem; }
+        .status { display: flex; gap: 1rem; }
+        .status-item { padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 0.8rem; }
+        .status-ok { background: #0f3460; color: #00d9a5; }
+        .status-warn { background: #0f3460; color: #ffbe0b; }
+        .status-fail { background: #0f3460; color: #ff6b6b; }
+        main { padding: 2rem; max-width: 1400px; margin: 0 auto; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 1.5rem; }
+        .card { background: #16213e; border-radius: 8px; padding: 1.5rem; border: 1px solid #0f3460; }
+        .card h2 { color: #e94560; margin-bottom: 1rem; font-size: 1.1rem; display: flex; align-items: center; gap: 0.5rem; }
+        .btn { background: #e94560; color: white; border: none; padding: 0.5rem 1rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; transition: 0.2s; }
+        .btn:hover { background: #d63650; }
+        .btn:disabled { background: #555; cursor: not-allowed; }
+        .btn-secondary { background: #0f3460; }
+        .btn-secondary:hover { background: #1a4a80; }
+        .module-list { max-height: 300px; overflow-y: auto; }
+        .module-item { padding: 0.5rem; border-bottom: 1px solid #0f3460; display: flex; justify-content: space-between; align-items: center; }
+        .module-item:last-child { border-bottom: none; }
+        .module-info { flex: 1; }
+        .module-name { font-weight: 500; }
+        .module-path { font-size: 0.75rem; color: #888; }
+        .log-panel { background: #0f0f23; border-radius: 4px; padding: 1rem; max-height: 300px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; line-height: 1.5; }
+        .log-line { margin: 0.25rem 0; }
+        .log-info { color: #00d9a5; }
+        .log-warn { color: #ffbe0b; }
+        .log-error { color: #ff6b6b; }
+        .input-group { display: flex; gap: 0.5rem; margin-top: 1rem; }
+        .input-group input { flex: 1; padding: 0.5rem; background: #0f3460; border: 1px solid #1a1a2e; border-radius: 4px; color: #eee; }
+        .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+        .tab { padding: 0.5rem 1rem; background: #0f3460; border: none; color: #eee; border-radius: 4px; cursor: pointer; }
+        .tab.active { background: #e94560; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .target-input { width: 100%; padding: 0.5rem; background: #0f3460; border: 1px solid #1a1a2e; border-radius: 4px; color: #eee; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>🦊 Metasploit Dashboard</h1>
+        <div class="status" id="statusBar">
+            <span class="status-item status-warn" id="status-msf">MSF: Checking...</span>
+            <span class="status-item status-warn" id="status-db">DB: Checking...</span>
+            <span class="status-item status-warn" id="status-pg">PG: Checking...</span>
+        </div>
+    </header>
+    <main>
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('modules')">Modules</button>
+            <button class="tab" onclick="showTab('scripts')">Scripts</button>
+            <button class="tab" onclick="showTab('scans')">Scans</button>
+            <button class="tab" onclick="showTab('msfconsole')">MSF Console</button>
+            <button class="tab" onclick="showTab('logs')">Logs</button>
+        </div>
+
+        <div id="tab-modules" class="tab-content active">
+            <div class="grid">
+                <div class="card">
+                    <h2>📦 Available Modules</h2>
+                    <div class="module-list" id="moduleList">Loading...</div>
+                </div>
+                <div class="card">
+                    <h2>▶️ Run Module</h2>
+                    <input type="text" class="target-input" id="moduleTarget" placeholder="Target (IP, CIDR, hostname)">
+                    <select id="moduleSelect" style="width:100%;padding:0.5rem;background:#0f3460;border:1px solid #1a1a2e;border-radius:4px;color:#eee;margin-bottom:1rem;">
+                        <option value="">Select a module first...</option>
+                    </select>
+                    <div class="input-group">
+                        <input type="text" id="moduleArgs" placeholder="Additional arguments (space-separated)">
+                        <button class="btn" onclick="runModule()">Run Module</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-scripts" class="tab-content">
+            <div class="grid">
+                <div class="card">
+                    <h2>📜 Available Scripts</h2>
+                    <div class="module-list" id="scriptList">Loading...</div>
+                </div>
+                <div class="card">
+                    <h2>▶️ Run Script</h2>
+                    <select id="scriptSelect" style="width:100%;padding:0.5rem;background:#0f3460;border:1px solid #1a1a2e;border-radius:4px;color:#eee;margin-bottom:1rem;">
+                        <option value="">Select a script...</option>
+                    </select>
+                    <div class="input-group">
+                        <input type="text" id="scriptArgs" placeholder="Arguments (space-separated)">
+                        <button class="btn" onclick="runScript()">Run Script</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-scans" class="tab-content">
+            <div class="grid">
+                <div class="card">
+                    <h2>🔍 Start Scan</h2>
+                    <input type="text" class="target-input" id="scanTarget" placeholder="Target IP or CIDR (e.g., 192.168.1.0/24)">
+                    <select id="scanType" style="width:100%;padding:0.5rem;background:#0f3460;border:1px solid #1a1a2e;border-radius:4px;color:#eee;margin-bottom:1rem;">
+                        <option value="quick">Quick Scan</option>
+                        <option value="full">Full Scan</option>
+                    </select>
+                    <button class="btn" onclick="startScan()">Start Scan</button>
+                </div>
+                <div class="card">
+                    <h2>📊 Active Scans</h2>
+                    <div id="scanList">No active scans</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-msfconsole" class="tab-content">
+            <div class="card">
+                <h2>💻 MSF Console</h2>
+                <div class="input-group">
+                    <input type="text" id="msfCommand" placeholder="Enter msfconsole command (e.g., 'db_status' or 'use exploit/windows/smb/ms17_010_eternalblue')">
+                    <button class="btn" onclick="runMsfCommand()">Execute</button>
+                </div>
+                <div class="log-panel" id="msfOutput">MSF output will appear here...</div>
+            </div>
+        </div>
+
+        <div id="tab-logs" class="tab-content">
+            <div class="card">
+                <h2>📋 System Logs</h2>
+                <div class="log-panel" id="systemLogs">System logs will appear here...</div>
+            </div>
+        </div>
+    </main>
+
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script>
+        const socket = io();
+        let modules = {};
+
+        // Socket events
+        socket.on('connect', () => { log('Connected to dashboard', 'info'); refreshStatus(); });
+        socket.on('disconnect', () => { log('Disconnected from dashboard', 'warn'); });
+        socket.on('scan_output', data => log(`[SCAN ${data.scan_id}] ${data.line}`, 'info'));
+        socket.on('scan_complete', data => log(`Scan ${data.scan_id} ${data.status}`, data.status === 'completed' ? 'info' : 'error'));
+        socket.on('module_complete', data => {
+            log(`[MODULE ${data.module}] ${data.success ? 'SUCCESS' : 'FAILED'}`, data.success ? 'info' : 'error');
+            if (data.output) log(data.output.substring(0, 500), 'info');
+        });
+        socket.on('script_complete', data => {
+            log(`[SCRIPT ${data.script}] ${data.success ? 'SUCCESS' : 'FAILED'}`, data.success ? 'info' : 'error');
+            if (data.output) log(data.output.substring(0, 500), 'info');
+        });
+        socket.on('command_output', data => log(data.line, 'info'));
+
+        function log(msg, type = 'info') {
+            const panel = document.getElementById('systemLogs');
+            const line = document.createElement('div');
+            line.className = `log-line log-${type}`;
+            line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            panel.appendChild(line);
+            panel.scrollTop = panel.scrollHeight;
+        }
+
+        function showTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById('tab-' + tabName).classList.add('active');
+        }
+
+        async function fetchAPI(url, options = {}) {
+            const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, ...options });
+            return res.json();
+        }
+
+        async function loadModules() {
+            try {
+                const data = await fetchAPI('/api/modules');
+                modules = data;
+                const list = document.getElementById('moduleList');
+                const select = document.getElementById('moduleSelect');
+                select.innerHTML = '<option value="">Select a module...</option>';
+                
+                let html = '';
+                for (const [cat, mods] of Object.entries(data)) {
+                    html += `<div style="margin-bottom:1rem;"><strong style="color:#e94560;">${cat}</strong>`;
+                    for (const mod of mods) {
+                        html += `<div class="module-item" onclick="selectModule('${mod.path}')">
+                            <div class="module-info">
+                                <div class="module-name">${mod.name}</div>
+                                <div class="module-path">${mod.path}</div>
+                            </div>
+                        </div>`;
+                        select.innerHTML += `<option value="${mod.path}">${mod.name} (${mod.path})</option>`;
+                    }
+                    html += '</div>';
+                }
+                list.innerHTML = html;
+            } catch (e) {
+                document.getElementById('moduleList').innerHTML = 'Error loading modules';
+                log('Failed to load modules: ' + e, 'error');
+            }
+        }
+
+        function selectModule(path) {
+            document.getElementById('moduleSelect').value = path;
+        }
+
+        async function runModule() {
+            const module = document.getElementById('moduleSelect').value;
+            const target = document.getElementById('moduleTarget').value;
+            const args = document.getElementById('moduleArgs').value.split(' ').filter(a => a);
+            if (!module) return alert('Select a module');
+            if (!target) return alert('Enter target');
+            
+            const fullArgs = [target, ...args];
+            await fetchAPI('/api/modules/run', { method: 'POST', body: JSON.stringify({ module, args: fullArgs }) });
+            log(`Starting module: ${module} on ${target}`, 'info');
+        }
+
+        async function loadScripts() {
+            try {
+                const data = await fetchAPI('/api/scripts');
+                const list = document.getElementById('scriptList');
+                const select = document.getElementById('scriptSelect');
+                select.innerHTML = '<option value="">Select a script...</option>';
+                
+                let html = '';
+                for (const s of data) {
+                    html += `<div class="module-item" onclick="selectScript('${s.file}')">
+                        <div class="module-info">
+                            <div class="module-name">${s.name}</div>
+                            <div class="module-path">${s.file}</div>
+                        </div>
+                    </div>`;
+                    select.innerHTML += `<option value="${s.file}">${s.name}</option>`;
+                }
+                list.innerHTML = html || 'No scripts found';
+            } catch (e) {
+                log('Failed to load scripts: ' + e, 'error');
+            }
+        }
+
+        function selectScript(file) {
+            document.getElementById('scriptSelect').value = file;
+        }
+
+        async function runScript() {
+            const script = document.getElementById('scriptSelect').value;
+            const args = document.getElementById('scriptArgs').value.split(' ').filter(a => a);
+            if (!script) return alert('Select a script');
+            await fetchAPI('/api/scripts/run', { method: 'POST', body: JSON.stringify({ script, args }) });
+            log(`Starting script: ${script}`, 'info');
+        }
+
+        async function startScan() {
+            const target = document.getElementById('scanTarget').value;
+            const type = document.getElementById('scanType').value;
+            if (!target) return alert('Enter target');
+            const res = await fetchAPI('/api/scan', { method: 'POST', body: JSON.stringify({ target, type }) });
+            if (res.scan_id) log(`Scan started: ${res.scan_id}`, 'info');
+        }
+
+        async function runMsfCommand() {
+            const cmd = document.getElementById('msfCommand').value;
+            if (!cmd) return;
+            const res = await fetchAPI('/api/msfconsole', { method: 'POST', body: JSON.stringify({ command: cmd }) });
+            if (res.output) log(res.output, 'info');
+            if (res.error) log(res.error, 'error');
+        }
+
+        async function refreshStatus() {
+            try {
+                const data = await fetchAPI('/api/status');
+                const msf = document.getElementById('status-msf');
+                const db = document.getElementById('status-db');
+                const pg = document.getElementById('status-pg');
+                
+                msf.textContent = 'MSF: ' + (data.msf_installed ? 'Installed' : 'Not Found');
+                msf.className = 'status-item ' + (data.msf_installed ? 'status-ok' : 'status-fail');
+                
+                db.textContent = 'DB: ' + (data.db_connected ? 'Connected' : 'Disconnected');
+                db.className = 'status-item ' + (data.db_connected ? 'status-ok' : 'status-warn');
+                
+                pg.textContent = 'PG: ' + (data.postgres_running ? 'Running' : 'Stopped');
+                pg.className = 'status-item ' + (data.postgres_running ? 'status-ok' : 'status-warn');
+            } catch (e) {
+                log('Status check failed: ' + e, 'error');
+            }
+        }
+
+        // Init
+        loadModules();
+        loadScripts();
+        refreshStatus();
+        setInterval(refreshStatus, 30000);
+    </script>
+</body>
+</html>

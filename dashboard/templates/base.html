@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Metasploit Dashboard{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        body { background: #1a1a2e; color: #e0e0e0; font-family: 'Monospace', monospace; }
+        .navbar { background: #16213e !important; border-bottom: 1px solid #0f3460; }
+        .card { background: #16213e; border: 1px solid #0f3460; }
+        .btn-primary { background: #e94560; border: none; }
+        .btn-primary:hover { background: #d63e5a; }
+        .btn-success { background: #00bfa5; border: none; }
+        .btn-danger { background: #e94560; border: none; }
+        .form-control, .form-select { background: #0f3460; border: 1px solid #0f3460; color: #e0e0e0; }
+        .form-control:focus { background: #16213e; border-color: #e94560; color: #e0e0e0; box-shadow: 0 0 0 0.2rem rgba(233,69,96,0.25); }
+        .terminal { background: #0f0f1a; border: 1px solid #0f3460; font-family: 'Fira Code', monospace; font-size: 13px; max-height: 500px; overflow-y: auto; padding: 15px; }
+        .terminal .line { margin: 2px 0; }
+        .terminal .success { color: #00bfa5; }
+        .terminal .error { color: #e94560; }
+        .terminal .info { color: #64b5f6; }
+        .terminal .warn { color: #ffb74d; }
+        .module-card { transition: transform 0.2s; }
+        .module-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(233,69,96,0.3); }
+        .scan-badge { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+        #output { white-space: pre-wrap; word-break: break-word; }
+        .nav-link { color: #a0a0b0; }
+        .nav-link:hover, .nav-link.active { color: #e94560; }
+        .sidebar { background: #16213e; border-right: 1px solid #0f3460; min-height: 100vh; padding: 20px; }
+        .main-content { padding: 20px; }
+        .stat-card { background: linear-gradient(135deg, #16213e 0%, #0f3460 100%); border: 1px solid #0f3460; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand text-danger fw-bold" href="/">
+                <i class="bi bi-terminal"></i> METASPLOIT DASHBOARD
+            </a>
+            <div class="navbar-nav ms-auto">
+                <span class="navbar-text me-3">
+                    <span class="badge bg-success" id="connection-status"><i class="bi bi-wifi"></i> Connected</span>
+                </span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid">
+        <div class="row">
+            <div class="col-md-3 col-lg-2 sidebar">
+                <h6 class="text-danger fw-bold mb-3"><i class="bi bi-list-task"></i> MODULES</h6>
+                <div class="list-group" id="module-tree">
+                    <div class="text-muted small">Loading...</div>
+                </div>
+                <hr class="text-secondary">
+                <h6 class="text-danger fw-bold mb-3"><i class="bi bi-terminal"></i> QUICK ACTIONS</h6>
+                <div class="d-grid gap-2">
+                    <button class="btn btn-outline-primary btn-sm" onclick="runMsCommand('db_status')">
+                        <i class="bi bi-database"></i> DB Status
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm" onclick="runMsCommand('workspace')">
+                        <i class="bi bi-folder"></i> Workspaces
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm" onclick="runMsCommand('hosts')">
+                        <i class="bi bi-hdd-network"></i> Hosts
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm" onclick="runMsCommand('services')">
+                        <i class="bi bi-server"></i> Services
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm" onclick="runMsCommand('vulns')">
+                        <i class="bi bi-bug"></i> Vulns
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm" onclick="runMsCommand('creds')">
+                        <i class="bi bi-key"></i> Creds
+                    </button>
+                </div>
+            </div>
+
+            <div class="col-md-9 col-lg-10 main-content">
+                {% block content %}{% endblock %}
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script>
+        const socket = io();
+        socket.on('connect', () => console.log('Socket connected'));
+        socket.on('command_output', data => appendOutput(data.line));
+        socket.on('scan_output', data => appendOutput(data.line, data.scan_id));
+        socket.on('scan_complete', data => showScanComplete(data));
+        socket.on('scan_error', data => showError(data.error));
+
+        function appendOutput(line, scanId = null) {
+            const output = document.getElementById(scanId ? 'scan-output-' + scanId : 'output');
+            if (output) {
+                const div = document.createElement('div');
+                div.className = 'line';
+                if (line.includes('[✓]') || line.includes('✓')) div.classList.add('success');
+                else if (line.includes('[✗]') || line.includes('✗')) div.classList.add('error');
+                else if (line.includes('[*]') || line.includes('*')) div.classList.add('info');
+                else if (line.includes('[!]') || line.includes('!')) div.classList.add('warn');
+                div.textContent = line;
+                output.appendChild(div);
+                output.scrollTop = output.scrollHeight;
+            }
+        }
+
+        function runMsCommand(cmd) {
+            fetch('/api/msfconsole', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({command: cmd})
+            }).then(r => r.json()).then(data => {
+                if (data.output) {
+                    document.getElementById('output').innerHTML = '';
+                    data.output.split('\n').forEach(l => appendOutput(l));
+                }
+            });
+        }
+
+        function loadModuleTree() {
+            fetch('/api/modules').then(r => r.json()).then(data => {
+                const tree = document.getElementById('module-tree');
+                tree.innerHTML = '';
+                for (const [category, modules] of Object.entries(data)) {
+                    const catDiv = document.createElement('div');
+                    catDiv.className = 'mb-2';
+                    catDiv.innerHTML = `
+                        <div class="fw-bold text-warning small" style="cursor:pointer" onclick="this.nextElementSibling.classList.toggle('d-none')">
+                            <i class="bi bi-chevron-right"></i> ${category.toUpperCase()} (${modules.length})
+                        </div>
+                        <div class="d-none ms-3">
+                            ${modules.map(m => `<button class="btn btn-outline-secondary btn-sm w-100 text-start mb-1" onclick="runModule('${m.path}')">${m.name}</button>`).join('')}
+                        </div>
+                    `;
+                    tree.appendChild(catDiv);
+                }
+            });
+        }
+
+        function runModule(path) {
+            const args = prompt('Arguments (space-separated):') || '';
+            fetch('/api/modules/run', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({module: path, args: args.split(' ')})
+            }).then(r => r.json()).then(data => {
+                document.getElementById('output').innerHTML = '';
+                data.output.split('\n').forEach(l => appendOutput(l));
+            });
+        }
+
+        function startScan() {
+            const target = document.getElementById('scan-target').value;
+            const type = document.getElementById('scan-type').value;
+            if (!target) return alert('Enter target');
+            
+            const scanId = 'scan_' + Date.now();
+            const container = document.getElementById('scan-results');
+            container.innerHTML += `
+                <div class="card mb-3" id="scan-${scanId}">
+                    <div class="card-header d-flex justify-content-between">
+                        <span>Scan: ${target} (${type})</span>
+                        <span class="badge bg-warning scan-badge" id="status-${scanId}">RUNNING</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="terminal" id="scan-output-${scanId}"></div>
+                    </div>
+                </div>
+            `;
+            
+            socket.emit('start_scan', {target, type});
+        }
+
+        function showScanComplete(data) {
+            const badge = document.getElementById('status-' + data.scan_id);
+            if (badge) {
+                badge.className = 'badge ' + (data.status === 'completed' ? 'bg-success' : 'bg-danger') + ' scan-badge';
+                badge.textContent = data.status.toUpperCase();
+            }
+        }
+
+        function showError(msg) {
+            alert('Error: ' + msg);
+        }
+
+        loadModuleTree();
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
